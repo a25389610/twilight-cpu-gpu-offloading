@@ -1,0 +1,1320 @@
+"""Twilight-inspired adaptive token selection for CPU--GPU KV offloading.
+
+This correctness-first Batch=1 prototype composes Quest's conservative page
+selector with per-token affine INT4 Key QK estimates and Top-p pruning.  It
+supports both the historical matched-H2D control and raw dynamic Top-p budgets.
+
+The default uses PyTorch operators. Opt-in local Triton backends fuse candidate
+preparation (triton_prepare) or preparation and QK (triton, experimental due to
+reduction-order differences). These are not official Twilight kernels.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import time
+from typing import Any, Optional
+
+import torch
+
+from .quest_offload_cache import QuestTopKOffloadedCache
+
+
+def affine_int4_pack(keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack per-token min/max affine INT4 keys along the final dimension."""
+    if keys.ndim != 2 or keys.shape[-1] % 2:
+        raise ValueError("keys must be [tokens, even head_dim]")
+    minimum = keys.amin(dim=-1)
+    maximum = keys.amax(dim=-1)
+    scale = ((maximum - minimum).float().clamp_min(1e-9) / 15.0).to(keys.dtype)
+    codes = torch.round(
+        (keys.float() - minimum.float().unsqueeze(-1))
+        / scale.float().unsqueeze(-1)
+    ).clamp_(0, 15).to(torch.uint8)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, scale, minimum
+
+
+def affine_int4_dequantize(
+    packed: torch.Tensor, scale: torch.Tensor, minimum: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize tensors produced by :func:`affine_int4_pack`."""
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    codes = torch.stack((low, high), dim=-1).flatten(-2).float()
+    return codes * scale.float().unsqueeze(-1) + minimum.float().unsqueeze(-1)
+
+
+def matched_budget_counts(
+    desired: list[int], target_total: int, capacities: list[int]
+) -> list[int]:
+    """Proportionally rescale Top-p counts to an exact positive total budget."""
+    if not desired or len(desired) != len(capacities):
+        raise ValueError("desired and capacities must be non-empty and aligned")
+    if any(value <= 0 for value in desired) or any(value <= 0 for value in capacities):
+        raise ValueError("desired counts and capacities must be positive")
+    if target_total < len(desired) or target_total > sum(capacities):
+        raise ValueError("target_total is infeasible")
+
+    remaining = target_total - len(desired)
+    weights = [float(value) for value in desired]
+    weight_sum = sum(weights)
+    raw_extra = [remaining * weight / weight_sum for weight in weights]
+    counts = [1 + min(capacities[i] - 1, int(math.floor(raw_extra[i]))) for i in range(len(desired))]
+
+    while sum(counts) < target_total:
+        candidates = [
+            i for i in range(len(counts)) if counts[i] < capacities[i]
+        ]
+        if not candidates:
+            raise AssertionError("unable to fill matched budget")
+        best = max(
+            candidates,
+            key=lambda i: (raw_extra[i] - math.floor(raw_extra[i]), desired[i], -i),
+        )
+        counts[best] += 1
+        raw_extra[best] = math.floor(raw_extra[best])
+
+    while sum(counts) > target_total:
+        candidates = [i for i in range(len(counts)) if counts[i] > 1]
+        if not candidates:
+            raise AssertionError("unable to reduce matched budget")
+        worst = min(candidates, key=lambda i: (desired[i], i))
+        counts[worst] -= 1
+    return counts
+
+
+def matched_budget_counts_tensor(
+    desired: torch.Tensor,
+    target_total: int,
+    capacity: int,
+) -> torch.Tensor:
+    """Vectorized exact matched-budget allocation for unsaturated GQA groups.
+
+    The deployed Twilight configuration has one shared candidate capacity for
+    every Query head and a per-group target no larger than that capacity.  In
+    that regime the capacity clamp in :func:`matched_budget_counts` cannot
+    activate, so the original largest-remainder rule can be expressed without
+    a CPU synchronization.  Stable sorts preserve its tie order:
+    fractional remainder, desired count, then lower head index.
+    """
+    if desired.ndim != 2 or desired.shape[1] <= 0:
+        raise ValueError("desired must be [groups, query_heads]")
+    heads = int(desired.shape[1])
+    if target_total < heads or target_total > capacity:
+        raise ValueError("target_total must be between head count and capacity")
+
+    desired_f64 = desired.to(torch.float64)
+    remaining = target_total - heads
+    raw_extra = remaining * desired_f64 / desired_f64.sum(dim=-1, keepdim=True)
+    floor_extra = torch.floor(raw_extra).to(torch.long)
+    counts = 1 + floor_extra
+    deficit = target_total - counts.sum(dim=-1)
+
+    # Start in natural index order.  The first stable sort supplies the
+    # secondary desired-count key; the second supplies the primary fractional
+    # remainder key while retaining desired/index tie ordering.
+    priority = torch.argsort(desired, dim=-1, descending=True, stable=True)
+    fractions = raw_extra - torch.floor(raw_extra)
+    ordered_fractions = torch.gather(fractions, -1, priority)
+    fractional_order = torch.argsort(
+        ordered_fractions, dim=-1, descending=True, stable=True
+    )
+    priority = torch.gather(priority, -1, fractional_order)
+    ranks = torch.empty_like(priority)
+    rank_values = torch.arange(heads, device=desired.device).expand_as(priority)
+    ranks.scatter_(-1, priority, rank_values)
+    counts += ranks.lt(deficit.unsqueeze(-1)).to(counts.dtype)
+    return counts
+
+
+class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
+    """Quest B0 + INT4 QK + Top-p with matched or raw-dynamic budgets.
+
+    The class name is retained for artifact compatibility.  ``budget_mode``
+    defaults to ``matched`` so all existing callers preserve their behavior.
+    """
+
+    def __init__(
+        self,
+        *,
+        candidate_token_budget: int = 8192,
+        top_p: float = 0.95,
+        matched_budget_fraction: float = 0.05,
+        budget_mode: str = "matched",
+        gqa_groupwise_execution: bool = False,
+        detailed_selection_profile: bool = False,
+        qk_backend: str = "pytorch",
+        cpu_flat_gather: bool = False,
+        cpu_bitmap_union: bool = False,
+        cpu_native_gather: bool = False,
+        direct_attention_layout: bool = False,
+        early_gpu_metadata: bool = False,
+        gather_h2d_chunks: int = 0,
+        reuse_quant_metadata: bool = False,
+        fused_final_indices: bool = False,
+        fused_quest_score: bool = False,
+        skip_unused_host_views: bool = False,
+        cpu_run_gather: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        if candidate_token_budget <= 0:
+            raise ValueError("candidate_token_budget must be positive")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if not 0.0 < matched_budget_fraction <= 1.0:
+            raise ValueError("matched_budget_fraction must be in (0, 1]")
+        if budget_mode not in {"matched", "dynamic"}:
+            raise ValueError("budget_mode must be 'matched' or 'dynamic'")
+        num_query_heads_per_kv = int(kwargs["num_query_heads_per_kv"])
+        layer_batched_selection = bool(kwargs.get("layer_batched_selection", False))
+        if qk_backend not in {"pytorch", "triton", "triton_prepare"}:
+            raise ValueError("unknown Twilight QK backend")
+        if qk_backend != "pytorch" and not layer_batched_selection:
+            raise ValueError("fused QK requires layer-batched selection")
+        self.qk_backend = qk_backend
+        self.cpu_flat_gather = bool(cpu_flat_gather)
+        self.cpu_bitmap_union = bool(cpu_bitmap_union)
+        self.cpu_native_gather = bool(cpu_native_gather)
+        self.direct_attention_layout = bool(direct_attention_layout)
+        self.early_gpu_metadata = bool(early_gpu_metadata)
+        self.gather_h2d_chunks = int(gather_h2d_chunks)
+        self.reuse_quant_metadata = bool(reuse_quant_metadata)
+        self.fused_final_indices = bool(fused_final_indices)
+        self.fused_quest_score = bool(fused_quest_score)
+        self.skip_unused_host_views = bool(skip_unused_host_views)
+        self.cpu_run_gather = bool(cpu_run_gather)
+        if self.cpu_run_gather:
+            if not (cpu_flat_gather and direct_attention_layout and gqa_groupwise_execution and gather_h2d_chunks > 0) or cpu_native_gather:
+                raise ValueError('run gather requires flat/direct/GQA chunk pipeline without native gather')
+            from .cpu_kv_run_gather import CpuKVRunGather
+            self._cpu_run_gather = CpuKVRunGather()
+        if self.fused_quest_score and not layer_batched_selection:
+            raise ValueError('fused Quest score requires layer-batched selection')
+        self._layer_quant_metadata = {}
+        if self.gather_h2d_chunks < 0:
+            raise ValueError('gather_h2d_chunks must be nonnegative')
+        if self.gather_h2d_chunks and not (cpu_flat_gather and direct_attention_layout and gqa_groupwise_execution) :
+            raise ValueError('chunk pipeline requires flat gather, direct layout and GQA execution')
+        if self.gather_h2d_chunks and cpu_native_gather:
+            raise ValueError('chunk pipeline pilot uses PyTorch gather only')
+        if self.early_gpu_metadata and not gqa_groupwise_execution:
+            raise ValueError('early GPU metadata requires GQA group execution')
+        if (cpu_native_gather or direct_attention_layout) and not (cpu_flat_gather and gqa_groupwise_execution):
+            raise ValueError('native gather/direct layout requires flat gather and GQA group execution')
+        if self.cpu_native_gather:
+            from .cpu_kv_gather import CpuKVGather
+            self._cpu_kv_gather = CpuKVGather()
+        if self.cpu_flat_gather and not gqa_groupwise_execution:
+            raise ValueError("cpu_flat_gather requires GQA group execution")
+        layer_flat_ragged_execution = bool(
+            kwargs.get("layer_flat_ragged_execution", False)
+        )
+        if gqa_groupwise_execution and not layer_batched_selection:
+            raise ValueError(
+                "GQA group-wise execution requires layer-batched selection"
+            )
+        if gqa_groupwise_execution and layer_flat_ragged_execution:
+            raise ValueError(
+                "GQA group-wise and per-Query-head flat execution are exclusive"
+            )
+        kwargs["budget_fraction"] = matched_budget_fraction
+        if budget_mode == "dynamic":
+            max_cache_len = int(kwargs["max_cache_len"])
+            sink_tokens = int(kwargs.get("sink_tokens", 64))
+            block_size = int(kwargs.get("block_size", 16))
+            max_pages = math.ceil(max(0, max_cache_len - sink_tokens) / block_size)
+            required_pages = min(
+                max_pages, math.ceil(candidate_token_budget / block_size)
+            )
+            kwargs["max_selected_history_fraction"] = (
+                required_pages / max_pages if max_pages else 1.0
+            )
+        else:
+            kwargs["max_selected_history_fraction"] = min(
+                1.0, matched_budget_fraction * num_query_heads_per_kv
+            )
+        super().__init__(**kwargs)
+        if self.cpu_bitmap_union:
+            if not gqa_groupwise_execution:
+                raise ValueError("cpu_bitmap_union requires GQA group execution")
+            from .cpu_token_union import CpuTokenUnion
+            self._cpu_token_union = CpuTokenUnion(self.geometry.max_cache_len)
+        self.candidate_token_budget = int(candidate_token_budget)
+        self.top_p = float(top_p)
+        self.matched_budget_fraction = float(matched_budget_fraction)
+        self.budget_mode = budget_mode
+        self.gqa_groupwise_execution = bool(gqa_groupwise_execution)
+        self.detailed_selection_profile = bool(detailed_selection_profile)
+        self._quant_key_packed: list[Optional[torch.Tensor]] = [
+            None
+        ] * self.geometry.num_entries
+        self._quant_key_scale: list[Optional[torch.Tensor]] = [
+            None
+        ] * self.geometry.num_entries
+        self._quant_key_minimum: list[Optional[torch.Tensor]] = [
+            None
+        ] * self.geometry.num_entries
+        self._cached_twilight_positions: list[
+            Optional[tuple[torch.Tensor, ...]]
+        ] = [None] * self.geometry.num_entries
+        self._capture_budget_trace = False
+        self._budget_trace: list[dict[str, Any]] = []
+        self._group_union_trace: list[dict[str, Any]] = []
+
+    def enable_selection_trace(self, enabled: bool = True) -> None:
+        super().enable_selection_trace(enabled)
+        self._group_union_trace = []
+
+    def group_union_trace(self) -> list[dict[str, Any]]:
+        return list(self._group_union_trace)
+
+    def enable_budget_trace(self, enabled: bool = True) -> None:
+        """Capture lightweight B1 counts for diagnostic-only runs."""
+        self._capture_budget_trace = bool(enabled)
+        self._budget_trace = []
+
+    def budget_trace(self) -> list[dict[str, Any]]:
+        return list(self._budget_trace)
+
+    def selected_positions_sha256(self) -> str:
+        """Hash the latest exact per-entry/per-Query-head selected positions."""
+        digest = hashlib.sha256()
+        for entry_index, positions in enumerate(self._cached_twilight_positions):
+            if positions is None:
+                continue
+            digest.update(entry_index.to_bytes(4, byteorder="little", signed=False))
+            digest.update(len(positions).to_bytes(4, byteorder="little", signed=False))
+            for selected in positions:
+                selected_cpu = selected.detach().to(
+                    device="cpu", dtype=torch.int64
+                ).contiguous()
+                digest.update(
+                    selected_cpu.numel().to_bytes(
+                        8, byteorder="little", signed=False
+                    )
+                )
+                digest.update(selected_cpu.numpy().tobytes())
+        return digest.hexdigest()
+
+    def _build_metadata(self, entry: int, key_states: torch.Tensor) -> None:
+        # Any rebuild invalidates the corresponding layer cache; never reuse
+        # a previous prompt's packed metadata.
+        for entries in list(self._layer_quant_metadata):
+            if entry in entries:
+                del self._layer_quant_metadata[entries]
+        super()._build_metadata(entry, key_states)
+        keys = key_states[0, 0]
+        packed, scale, minimum = affine_int4_pack(keys)
+        self._quant_key_packed[entry] = packed
+        self._quant_key_scale[entry] = scale
+        self._quant_key_minimum[entry] = minimum
+
+    def _record_phase_start(self) -> Optional[torch.cuda.Event]:
+        if not self.metrics_enabled:
+            return None
+        start = self._event(timing=True)
+        start.record(torch.cuda.current_stream(self.device))
+        return start
+
+    def _record_phase_end(self, name: str, start: Optional[torch.cuda.Event]) -> None:
+        if start is None:
+            return
+        end = self._event(timing=True)
+        end.record(torch.cuda.current_stream(self.device))
+        self._timing_events.append((name, start, end))
+
+    def _record_detailed_phase_start(self) -> Optional[torch.cuda.Event]:
+        if not self.detailed_selection_profile:
+            return None
+        return self._record_phase_start()
+
+    def prepare_layer_selection(
+        self,
+        *,
+        entries: list[int],
+        queries: list[torch.Tensor],
+    ) -> None:
+        """Batch both Twilight selection stages across one decoder layer."""
+        if not self.layer_batched_selection:
+            return
+        if len(entries) != len(queries) or not entries:
+            raise ValueError("entries and queries must be non-empty and aligned")
+        if len(set(entries)) != len(entries):
+            raise ValueError("layer entries must be unique")
+        expected_query_shape = (
+            1,
+            self.num_query_heads_per_kv,
+            1,
+            self.geometry.head_dim,
+        )
+        if any(tuple(query.shape) != expected_query_shape for query in queries):
+            raise ValueError("unexpected layer Query shape")
+
+        old_lengths = [self._logical_lengths[entry] for entry in entries]
+        if len(set(old_lengths)) != 1:
+            raise AssertionError("layer KV entries have unequal logical lengths")
+        old_length = old_lengths[0]
+        sink_end = min(self.sink_tokens, old_length)
+        historical_recent = max(0, self.recent_tokens - 1)
+        recent_start = max(sink_end, old_length - historical_recent)
+        eligible_tokens = max(0, recent_start - sink_end)
+        candidate_pages = eligible_tokens // self.block_size
+        fixed_pages = min(
+            candidate_pages,
+            max(
+                1,
+                math.ceil(
+                    self.matched_budget_fraction
+                    * eligible_tokens
+                    / self.block_size
+                ),
+            ),
+        )
+        b0_pages = min(
+            candidate_pages,
+            max(1, math.ceil(self.candidate_token_budget / self.block_size)),
+        )
+
+        page_metadata = [
+            (self._page_min[entry], self._page_max[entry]) for entry in entries
+        ]
+        quant_metadata = [
+            (
+                self._quant_key_packed[entry],
+                self._quant_key_scale[entry],
+                self._quant_key_minimum[entry],
+            )
+            for entry in entries
+        ]
+        if any(
+            page_min is None or page_max is None
+            for page_min, page_max in page_metadata
+        ) or any(
+            packed is None or scale is None or minimum is None
+            for packed, scale, minimum in quant_metadata
+        ):
+            raise RuntimeError("Twilight prompt metadata is missing")
+        candidate_pages = min(
+            candidate_pages,
+            *(
+                int(page_min.shape[0])
+                for page_min, _ in page_metadata
+                if page_min is not None
+            ),
+        )
+        fixed_pages = min(fixed_pages, candidate_pages)
+        b0_pages = min(b0_pages, candidate_pages)
+
+        if candidate_pages == 0 or fixed_pages == 0 or b0_pages == 0:
+            empty = tuple(
+                torch.empty(0, dtype=torch.long)
+                for _ in range(self.num_query_heads_per_kv)
+            )
+            for entry in entries:
+                self._cached_twilight_positions[entry] = empty
+                self._layer_prepared_entries.add(entry)
+            return
+
+        selector_wall_started = time.perf_counter() if self.metrics_enabled else None
+        groups = len(entries)
+        query_heads = self.num_query_heads_per_kv
+
+        selection_cuda_phase = self._record_detailed_phase_start()
+        subphase = self._record_detailed_phase_start()
+        q = torch.stack([query[0, :, 0] for query in queries], dim=0).float()
+        self._record_phase_end("twilight_query_prepare", subphase)
+
+        phase = self._record_phase_start()
+        subphase = self._record_detailed_phase_start()
+        page_min = torch.stack(
+            [page_min[:candidate_pages] for page_min, _ in page_metadata if page_min is not None],
+            dim=0,
+        )
+        page_max = torch.stack(
+            [page_max[:candidate_pages] for _, page_max in page_metadata if page_max is not None],
+            dim=0,
+        )
+        if self.fused_quest_score:
+            from .twilight_fused_quest import fused_quest_score
+            page_scores = fused_quest_score(q, page_min, page_max)
+        else:
+            extrema = torch.where(q.unsqueeze(2) > 0, page_max.unsqueeze(1), page_min.unsqueeze(1))
+            page_scores = (extrema.float() * q.unsqueeze(2)).sum(dim=-1)
+        self._record_phase_end("twilight_quest_metadata_score", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        chosen_pages = torch.topk(
+            page_scores, k=b0_pages, dim=-1, largest=True, sorted=False
+        ).indices
+        self._record_phase_end("twilight_quest_page_topk", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        offsets = torch.arange(
+            self.block_size, device=self.device, dtype=torch.long
+        )
+        candidate_positions = (
+            self.sink_tokens
+            + chosen_pages.unsqueeze(-1) * self.block_size
+            + offsets
+        ).flatten(-2)
+        self._record_phase_end("twilight_b0_token_expand", subphase)
+        self._record_phase_end("twilight_quest_b0", phase)
+
+        phase = self._record_phase_start()
+        subphase = self._record_detailed_phase_start()
+        metadata_key = tuple(entries)
+        cached_quant = self._layer_quant_metadata.get(metadata_key) if self.reuse_quant_metadata else None
+        if cached_quant is None:
+            packed = torch.stack(
+                [packed for packed, _, _ in quant_metadata if packed is not None], dim=0
+            )
+            scale = torch.stack(
+                [scale for _, scale, _ in quant_metadata if scale is not None], dim=0
+            )
+            minimum = torch.stack(
+                [minimum for _, _, minimum in quant_metadata if minimum is not None], dim=0
+            )
+            if self.reuse_quant_metadata:
+                self._layer_quant_metadata[metadata_key] = (packed, scale, minimum)
+                for i, entry in enumerate(entries):
+                    self._quant_key_packed[entry] = packed[i]
+                    self._quant_key_scale[entry] = scale[i]
+                    self._quant_key_minimum[entry] = minimum[i]
+        else:
+            packed, scale, minimum = cached_quant
+        self._record_phase_end("twilight_int4_metadata_stack", subphase)
+
+        if self.qk_backend == "triton_prepare":
+            from .twilight_fused_qk import fused_affine_int4_qk
+            subphase = self._record_detailed_phase_start()
+            estimated_keys = fused_affine_int4_qk(
+                q, packed, scale, minimum, candidate_positions, materialize=True)
+            self._record_phase_end("twilight_fused_int4_prepare", subphase)
+            subphase = self._record_detailed_phase_start()
+            logits = torch.matmul(estimated_keys, q.unsqueeze(-1)).squeeze(-1)
+            self._record_phase_end("twilight_fp32_qk_matmul", subphase)
+        elif self.qk_backend == "triton":
+            from .twilight_fused_qk import fused_affine_int4_qk
+            subphase = self._record_detailed_phase_start()
+            logits = fused_affine_int4_qk(q, packed, scale, minimum, candidate_positions)
+            self._record_phase_end("twilight_fused_int4_qk", subphase)
+        else:
+            subphase = self._record_detailed_phase_start()
+            packed_index = candidate_positions.unsqueeze(-1).expand(
+                groups,
+                query_heads,
+                candidate_positions.shape[-1],
+                packed.shape[-1],
+            )
+            selected_packed = torch.gather(
+                packed.unsqueeze(1).expand(-1, query_heads, -1, -1),
+                2,
+                packed_index,
+            )
+            selected_scale = torch.gather(
+                scale.unsqueeze(1).expand(-1, query_heads, -1),
+                2,
+                candidate_positions,
+            )
+            selected_minimum = torch.gather(
+                minimum.unsqueeze(1).expand(-1, query_heads, -1),
+                2,
+                candidate_positions,
+            )
+            self._record_phase_end("twilight_int4_candidate_gather", subphase)
+
+            if self.detailed_selection_profile and self.metrics_enabled:
+                subphase = self._record_detailed_phase_start()
+                low = selected_packed & 0x0F
+                high = (selected_packed >> 4) & 0x0F
+                codes = torch.stack((low, high), dim=-1).flatten(-2).float()
+                self._record_phase_end("twilight_int4_unpack_to_fp32_codes", subphase)
+
+                subphase = self._record_detailed_phase_start()
+                estimated_keys = (
+                    codes * selected_scale.float().unsqueeze(-1)
+                    + selected_minimum.float().unsqueeze(-1)
+                )
+                self._record_phase_end(
+                    "twilight_int4_affine_dequant_and_fp32_k_materialize", subphase
+                )
+            else:
+                estimated_keys = affine_int4_dequantize(
+                    selected_packed, selected_scale, selected_minimum
+                )
+
+            subphase = self._record_detailed_phase_start()
+            logits = torch.matmul(estimated_keys, q.unsqueeze(-1)).squeeze(-1)
+            self._record_phase_end("twilight_fp32_qk_matmul", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        logits /= math.sqrt(self.geometry.head_dim)
+        self._record_phase_end("twilight_qk_scale", subphase)
+        self._record_phase_end("twilight_int4_qk", phase)
+
+        phase = self._record_phase_start()
+        subphase = self._record_detailed_phase_start()
+        order = torch.argsort(logits, dim=-1, descending=True)
+        self._record_phase_end("twilight_argsort", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        ordered_logits = torch.gather(logits, -1, order)
+        self._record_phase_end("twilight_sorted_logits_gather", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        probabilities = torch.softmax(ordered_logits, dim=-1)
+        self._record_phase_end("twilight_fp32_softmax", subphase)
+        # CUDA uses a different parallel scan for a 2-D cumsum than for the
+        # original per-head 1-D tensors.  The ~1e-7 rounding drift can cross a
+        # Top-p boundary.  Enqueue the 24 original 1-D scans without any host
+        # synchronization, then continue with batched search/allocation.
+        subphase = self._record_detailed_phase_start()
+        cumulative = torch.stack(
+            [row.cumsum(dim=0) for row in probabilities.flatten(0, 1)], dim=0
+        ).view_as(probabilities)
+        self._record_phase_end("twilight_cumsum", subphase)
+
+        subphase = self._record_detailed_phase_start()
+        thresholds = torch.full(
+            (*cumulative.shape[:-1], 1),
+            self.top_p,
+            dtype=cumulative.dtype,
+            device=self.device,
+        )
+        desired = torch.searchsorted(
+            cumulative.contiguous(), thresholds, right=False
+        ).squeeze(-1) + 1
+        desired.clamp_max_(order.shape[-1])
+        self._record_phase_end("twilight_top_p_threshold", subphase)
+        self._record_phase_end("twilight_top_p", phase)
+
+        subphase = self._record_detailed_phase_start()
+        target_total = fixed_pages * self.block_size * query_heads
+        allocated = (
+            desired
+            if self.budget_mode == "dynamic"
+            else matched_budget_counts_tensor(
+                desired, target_total, int(order.shape[-1])
+            )
+        )
+        max_allocated = (
+            int(order.shape[-1])
+            if self.budget_mode == "dynamic"
+            else target_total - (query_heads - 1)
+        )
+        if self.fused_final_indices:
+            from .twilight_fused_indices import fused_gather_mask
+            masked_positions = fused_gather_mask(candidate_positions, order, allocated, max_allocated, old_length)
+            sorted_selected = masked_positions.sort(dim=-1).values
+        else:
+            ranked_positions = torch.gather(candidate_positions, -1, order)
+            ranked_prefix = ranked_positions[..., :max_allocated]
+            active = torch.arange(max_allocated, device=self.device).view(1, 1, -1)
+            active = active < allocated.unsqueeze(-1)
+            sentinel = torch.full_like(ranked_prefix, old_length)
+            sorted_selected = torch.where(active, ranked_prefix, sentinel).sort(dim=-1).values
+        # Counts, Top-p desired counts, and all ragged selected positions share
+        # one GPU-to-CPU synchronization for the entire layer.
+        transfer = torch.cat(
+            (allocated.unsqueeze(-1), desired.unsqueeze(-1), sorted_selected),
+            dim=-1,
+        ).reshape(groups * query_heads, -1)
+        self._record_phase_end("twilight_final_b1_indices", subphase)
+        self._record_phase_end(
+            "twilight_selection_before_d2h", selection_cuda_phase
+        )
+        sync_started = time.perf_counter() if self.metrics_enabled else None
+        transfer_cpu = transfer.cpu()
+        sync_finished = time.perf_counter() if self.metrics_enabled else None
+
+        allocated_cpu = transfer_cpu[:, 0].view(groups, query_heads)
+        desired_cpu = transfer_cpu[:, 1].view(groups, query_heads)
+        rows = transfer_cpu[:, 2:]
+        decode_step = (
+            old_length - self._prompt_length + 1
+            if self._prompt_length is not None
+            else None
+        )
+        protected_tokens = sink_end + (old_length - recent_start)
+        for group_index, entry in enumerate(entries):
+            start = group_index * query_heads
+            selected: list[torch.Tensor] = []
+            for head_index in range(query_heads):
+                count = int(allocated_cpu[group_index, head_index])
+                selected_row = rows[start + head_index, :count]
+                selected.append(selected_row)
+                if self._capture_budget_trace:
+                    source_pages = torch.div(
+                        selected_row - self.sink_tokens,
+                        self.block_size,
+                        rounding_mode="floor",
+                    )
+                    self._budget_trace.append(
+                        {
+                            "decode_step": decode_step,
+                            "entry": entry,
+                            "layer": entries[0] // groups,
+                            "kv_head": group_index,
+                            "query_head_in_group": head_index,
+                            "query_head": group_index * query_heads + head_index,
+                            "budget_mode": self.budget_mode,
+                            "b0_tokens": int(order.shape[-1]),
+                            "raw_b1_tokens": int(desired_cpu[group_index, head_index]),
+                            "selected_adaptive_tokens": count,
+                            "protected_tokens": protected_tokens,
+                            "selected_history_tokens": protected_tokens + count,
+                            "eligible_history_tokens": eligible_tokens,
+                            "full_history_tokens": old_length,
+                            "unique_source_pages": int(
+                                torch.unique(source_pages).numel()
+                            ),
+                        }
+                    )
+            self._cached_twilight_positions[entry] = tuple(selected)
+            self._layer_prepared_entries.add(entry)
+
+        if self.metrics_enabled:
+            assert selector_wall_started is not None
+            assert sync_started is not None and sync_finished is not None
+            self.metrics["twilight_index_sync_and_position_wall_seconds"] += (
+                sync_finished - sync_started
+            )
+            self.metrics["twilight_selector_wall_seconds"] += (
+                sync_finished - selector_wall_started
+            )
+            self.metrics["twilight_raw_top_p_tokens_total"] += int(desired_cpu.sum())
+            self.metrics["twilight_allocated_tokens_total"] += int(allocated_cpu.sum())
+            self.metrics["twilight_allocated_tokens_min_sum"] += int(
+                allocated_cpu.min(dim=-1).values.sum()
+            )
+            self.metrics["twilight_allocated_tokens_max_sum"] += int(
+                allocated_cpu.max(dim=-1).values.sum()
+            )
+            self.metrics["twilight_b0_tokens_total"] += int(
+                groups * query_heads * order.shape[-1]
+            )
+            self.metrics["twilight_groups"] += groups
+            self.metrics["twilight_selector_batch_calls"] += 1
+            self.metrics["twilight_index_sync_calls"] += 1
+            if self.detailed_selection_profile:
+                self.metrics["twilight_profile_old_length"] = old_length
+                self.metrics["twilight_profile_eligible_tokens"] = eligible_tokens
+                self.metrics["twilight_profile_candidate_pages"] = candidate_pages
+                self.metrics["twilight_profile_b0_pages"] = b0_pages
+                self.metrics["twilight_profile_b0_tokens_per_query_head"] = int(
+                    order.shape[-1]
+                )
+                self.metrics["twilight_profile_groups"] = groups
+                self.metrics["twilight_profile_query_heads_per_group"] = query_heads
+                self.metrics["twilight_profile_head_dim"] = self.geometry.head_dim
+            self.metrics["selector_total_wall_seconds"] += (
+                time.perf_counter() - selector_wall_started
+            )
+
+    def _selected_positions(
+        self,
+        *,
+        query: torch.Tensor,
+        entry: int,
+        old_length: int,
+    ) -> list[torch.Tensor]:
+        sink_end = min(self.sink_tokens, old_length)
+        historical_recent = max(0, self.recent_tokens - 1)
+        recent_start = max(sink_end, old_length - historical_recent)
+        prepared_for_entry = entry in self._layer_prepared_entries
+        if prepared_for_entry:
+            cached = self._cached_twilight_positions[entry]
+            if cached is None:
+                raise AssertionError("prepared Twilight selection is missing")
+            sink_cpu = torch.arange(sink_end, dtype=torch.long)
+            recent_cpu = torch.arange(recent_start, old_length, dtype=torch.long)
+            positions = []
+            decode_step = (
+                old_length - self._prompt_length + 1
+                if self._prompt_length is not None
+                else None
+            )
+            for group_head, selected in enumerate(cached):
+                positions.append(torch.cat((sink_cpu, selected, recent_cpu)))
+                if self._capture_selection_trace:
+                    self._selection_trace.append(
+                        {
+                            "decode_step": decode_step,
+                            "entry": entry,
+                            "query_head_in_group": group_head,
+                            "selected_token_indices": tuple(
+                                int(value) for value in selected.tolist()
+                            ),
+                        }
+                    )
+            self._layer_prepared_entries.discard(entry)
+            return positions
+        eligible_tokens = max(0, recent_start - sink_end)
+        candidate_pages = eligible_tokens // self.block_size
+        fixed_pages = min(
+            candidate_pages,
+            max(
+                1,
+                math.ceil(
+                    self.matched_budget_fraction
+                    * eligible_tokens
+                    / self.block_size
+                ),
+            ),
+        )
+        b0_pages = min(
+            candidate_pages,
+            max(1, math.ceil(self.candidate_token_budget / self.block_size)),
+        )
+
+        page_min = self._page_min[entry]
+        page_max = self._page_max[entry]
+        packed = self._quant_key_packed[entry]
+        scale = self._quant_key_scale[entry]
+        minimum = self._quant_key_minimum[entry]
+        if any(item is None for item in (page_min, page_max, packed, scale, minimum)):
+            raise RuntimeError("Twilight prompt metadata is missing")
+        assert page_min is not None and page_max is not None
+        assert packed is not None and scale is not None and minimum is not None
+        candidate_pages = min(candidate_pages, int(page_min.shape[0]))
+        fixed_pages = min(fixed_pages, candidate_pages)
+        b0_pages = min(b0_pages, candidate_pages)
+
+        sink_cpu = torch.arange(sink_end, dtype=torch.long)
+        recent_cpu = torch.arange(recent_start, old_length, dtype=torch.long)
+        if candidate_pages == 0 or fixed_pages == 0 or b0_pages == 0:
+            selected = torch.cat((sink_cpu, recent_cpu))
+            return [selected.clone() for _ in range(self.num_query_heads_per_kv)]
+
+        ranked_tokens: list[torch.Tensor] = []
+        desired_counts: list[int] = []
+        candidate_counts: list[int] = []
+        offsets = torch.arange(self.block_size, device=self.device, dtype=torch.long)
+        sqrt_dim = math.sqrt(self.geometry.head_dim)
+        selector_wall_started = time.perf_counter() if self.metrics_enabled else None
+
+        for group_head in range(self.num_query_heads_per_kv):
+            q = query[0, group_head, 0].float()
+
+            phase = self._record_phase_start()
+            extrema = torch.where(
+                q.unsqueeze(0) > 0,
+                page_max[:candidate_pages],
+                page_min[:candidate_pages],
+            )
+            page_scores = (extrema.float() * q.unsqueeze(0)).sum(dim=-1)
+            chosen_pages = torch.topk(
+                page_scores, k=b0_pages, largest=True, sorted=False
+            ).indices
+            candidate_positions = (
+                self.sink_tokens
+                + chosen_pages.unsqueeze(1) * self.block_size
+                + offsets.unsqueeze(0)
+            ).reshape(-1)
+            self._record_phase_end("twilight_quest_b0", phase)
+
+            phase = self._record_phase_start()
+            selected_packed = packed.index_select(0, candidate_positions)
+            estimated_keys = affine_int4_dequantize(
+                selected_packed,
+                scale.index_select(0, candidate_positions),
+                minimum.index_select(0, candidate_positions),
+            )
+            logits = torch.mv(estimated_keys, q) / sqrt_dim
+            self._record_phase_end("twilight_int4_qk", phase)
+
+            phase = self._record_phase_start()
+            order = torch.argsort(logits, descending=True)
+            ordered_logits = logits.index_select(0, order)
+            cumulative = torch.softmax(ordered_logits, dim=0).cumsum(dim=0)
+            desired = int(
+                torch.searchsorted(
+                    cumulative,
+                    torch.tensor(self.top_p, device=self.device),
+                    right=False,
+                ).item()
+            ) + 1
+            desired = min(desired, int(order.numel()))
+            self._record_phase_end("twilight_top_p", phase)
+            ranked_tokens.append(candidate_positions.index_select(0, order))
+            desired_counts.append(desired)
+            candidate_counts.append(int(order.numel()))
+
+        target_total = fixed_pages * self.block_size * self.num_query_heads_per_kv
+        allocated_counts = (
+            desired_counts
+            if self.budget_mode == "dynamic"
+            else matched_budget_counts(
+                desired_counts, target_total, candidate_counts
+            )
+        )
+        positions: list[torch.Tensor] = []
+        sync_started = time.perf_counter() if self.metrics_enabled else None
+        for ranked, allocated in zip(ranked_tokens, allocated_counts):
+            chosen_cpu = ranked[:allocated].sort().values.cpu()
+            positions.append(torch.cat((sink_cpu, chosen_cpu, recent_cpu)))
+            if self._capture_budget_trace:
+                head_index = len(positions) - 1
+                source_pages = torch.div(
+                    chosen_cpu - self.sink_tokens,
+                    self.block_size,
+                    rounding_mode="floor",
+                )
+                protected_tokens = sink_end + (old_length - recent_start)
+                self._budget_trace.append(
+                    {
+                        "decode_step": (
+                            old_length - self._prompt_length + 1
+                            if self._prompt_length is not None
+                            else None
+                        ),
+                        "entry": entry,
+                        "layer": None,
+                        "kv_head": None,
+                        "query_head_in_group": head_index,
+                        "query_head": None,
+                        "budget_mode": self.budget_mode,
+                        "b0_tokens": candidate_counts[head_index],
+                        "raw_b1_tokens": desired_counts[head_index],
+                        "selected_adaptive_tokens": allocated,
+                        "protected_tokens": protected_tokens,
+                        "selected_history_tokens": protected_tokens + allocated,
+                        "eligible_history_tokens": eligible_tokens,
+                        "full_history_tokens": old_length,
+                        "unique_source_pages": int(
+                            torch.unique(source_pages).numel()
+                        ),
+                    }
+                )
+            if self._capture_selection_trace:
+                self._selection_trace.append(
+                    {
+                        "decode_step": (
+                            old_length - self._prompt_length + 1
+                            if self._prompt_length is not None
+                            else None
+                        ),
+                        "entry": entry,
+                        "query_head_in_group": len(positions) - 1,
+                        "selected_token_indices": tuple(
+                            int(value) for value in chosen_cpu.tolist()
+                        ),
+                    }
+                )
+        if self.metrics_enabled:
+            sync_finished = time.perf_counter()
+            self.metrics["twilight_index_sync_and_position_wall_seconds"] += (
+                sync_finished - sync_started
+            )
+            self.metrics["twilight_selector_wall_seconds"] += (
+                sync_finished - selector_wall_started
+            )
+            self.metrics["twilight_raw_top_p_tokens_total"] += sum(desired_counts)
+            self.metrics["twilight_allocated_tokens_total"] += sum(allocated_counts)
+            self.metrics["twilight_allocated_tokens_min_sum"] += min(allocated_counts)
+            self.metrics["twilight_allocated_tokens_max_sum"] += max(allocated_counts)
+            self.metrics["twilight_b0_tokens_total"] += sum(candidate_counts)
+            self.metrics["twilight_groups"] += 1
+        if self.budget_mode == "matched" and sum(allocated_counts) != target_total:
+            raise AssertionError("Twilight matched budget drifted from Quest")
+        return positions
+
+    def update_layer_gqa_group_ragged(
+        self,
+        *,
+        key_states: list[torch.Tensor],
+        value_states: list[torch.Tensor],
+        queries: list[torch.Tensor],
+        entries: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, tuple[int, ...]]:
+        """Pack one shared union of selected K/V for every GQA query group.
+
+        Quest B0 and Twilight Top-p remain per Query head.  For each KV head,
+        the final history is the exact set union of the selected histories of
+        its Query heads.  That union is gathered and transferred once, then
+        consumed by a varlen attention sequence with ``num_q_heads_per_kv``
+        Query heads and one KV head, matching Twilight Appendix B.2.
+        """
+        if not self.gqa_groupwise_execution:
+            raise RuntimeError("Twilight GQA group-wise execution is disabled")
+        if not (
+            len(entries) == len(key_states) == len(value_states) == len(queries)
+            and entries
+        ):
+            raise ValueError("layer entries, K/V, and Queries must be aligned")
+        if len(set(entries)) != len(entries):
+            raise ValueError("layer entries must be unique")
+        group_count = len(entries)
+        self._ensure_layer_flat_buffers(group_count)
+
+        old_lengths: list[int] = []
+        new_lengths: list[int] = []
+        for entry, key, value in zip(entries, key_states, value_states):
+            if key.shape != value.shape or key.shape != (
+                1,
+                1,
+                1,
+                self.geometry.head_dim,
+            ):
+                raise ValueError("GQA group decode expects [1, 1, 1, dim] K/V")
+            old_length, new_length = self._bookkeeping.preview(entry, 1)
+            self._bookkeeping.advance(entry, 1)
+            self._initialized[entry] = True
+            old_lengths.append(old_length)
+            new_lengths.append(new_length)
+        self._seen_tokens = self._bookkeeping.seen_tokens
+        if len(set(old_lengths)) != 1:
+            raise AssertionError("layer KV entries have unequal logical lengths")
+        old_length = old_lengths[0]
+
+        update_started = time.perf_counter() if self.metrics_enabled else None
+        phase_started = time.perf_counter() if self.metrics_enabled else None
+        for entry in entries:
+            host_ready = self._host_write_done[entry]
+            if host_ready is not None:
+                host_ready.synchronize()
+        if self.metrics_enabled:
+            self.metrics["host_ready_wait_wall_seconds"] += (
+                time.perf_counter() - phase_started
+            )
+
+        # Reproduce the unmodified per-Query-head selected sets first.  The
+        # union below is the only selection-semantic transformation.
+        layer_positions: list[list[torch.Tensor]] = []
+        for entry, query in zip(entries, queries):
+            positions = self._selected_positions(
+                query=query, entry=entry, old_length=old_length
+            )
+            layer_positions.append(positions)
+
+        union_started = time.perf_counter() if self.metrics_enabled else None
+        group_positions = [
+            self._cpu_token_union(positions, old_length) if self.cpu_bitmap_union
+            else torch.unique(torch.cat(positions), sorted=True)
+            for positions in layer_positions
+        ]
+        if self._capture_selection_trace:
+            decode_step = (
+                old_length - self._prompt_length + 1
+                if self._prompt_length is not None
+                else None
+            )
+            groups_per_layer = len(entries)
+            for group_index, (entry, union) in enumerate(
+                zip(entries, group_positions)
+            ):
+                self._group_union_trace.append(
+                    {
+                        "decode_step": decode_step,
+                        "entry": entry,
+                        "layer": entries[0] // groups_per_layer,
+                        "kv_head": group_index,
+                        "selected_history_indices": tuple(
+                            int(value) for value in union.tolist()
+                        ),
+                    }
+                )
+        if self.metrics_enabled:
+            assert union_started is not None
+            self.metrics["twilight_group_union_prepare_wall_seconds"] += (
+                time.perf_counter() - union_started
+            )
+            self.metrics["twilight_group_union_prepare_calls"] += 1
+
+        per_q_lengths = tuple(
+            int(selected.numel())
+            for positions in layer_positions
+            for selected in positions
+        )
+        group_history_lengths = tuple(
+            int(selected.numel()) for selected in group_positions
+        )
+        group_total_lengths = tuple(length + 1 for length in group_history_lengths)
+        per_q_history_total = sum(per_q_lengths)
+        total_history = sum(group_history_lengths)
+        total_attention = sum(group_total_lengths)
+        if total_history > per_q_history_total:
+            raise AssertionError("GQA union cannot exceed per-Query-head payload")
+
+        def build_cu_seqlens():
+            started = time.perf_counter() if self.metrics_enabled else None
+            result = torch.tensor(
+                [0, *torch.tensor(group_total_lengths).cumsum(0).tolist()],
+                dtype=torch.int32, device=self.device,
+            )
+            if started is not None:
+                self.metrics['gpu_metadata_build_wall_seconds'] += time.perf_counter() - started
+            return result
+
+        cu_seqlens = build_cu_seqlens() if self.early_gpu_metadata else None
+
+        slot = self._layer_flat_cursor
+        self._layer_flat_cursor = 1 - self._layer_flat_cursor
+        phase_started = time.perf_counter() if self.metrics_enabled else None
+        ready = self._layer_flat_ready[slot]
+        if ready is not None:
+            ready.synchronize()
+        if self.metrics_enabled:
+            self.metrics["pack_ready_wait_wall_seconds"] += (
+                time.perf_counter() - phase_started
+            )
+            phase_started = time.perf_counter()
+
+        host_flat_key = self._host_layer_flat_keys[slot]
+        host_flat_value = self._host_layer_flat_values[slot]
+        history_offset = 0
+        transfer_rows = total_attention if self.direct_attention_layout else total_history
+        if transfer_rows > host_flat_key.shape[0]:
+            raise ValueError('insufficient host pack capacity for direct attention layout')
+        new_token_offsets = []
+        pipeline_enqueue_seconds = 0.0
+        pipeline_chunks = 0
+        for entry, selected in zip(entries, group_positions):
+            if not (self.skip_unused_host_views and self.cpu_flat_gather):
+                host_key = self._host_tensor("key", entry)[0, 0, :old_length]
+                host_value = self._host_tensor("value", entry)[0, 0, :old_length]
+            stop = history_offset + int(selected.numel())
+            if self.cpu_flat_gather:
+                torch.add(selected, entry * self.geometry.max_cache_len,
+                          out=self._host_layer_flat_row_indices[slot][history_offset:stop])
+            else:
+                torch.index_select(
+                    host_key, 0, selected, out=host_flat_key[history_offset:stop]
+                )
+                torch.index_select(
+                    host_value, 0, selected, out=host_flat_value[history_offset:stop]
+                )
+            if self.direct_attention_layout:
+                # Initialized source row for each gap; overwritten by the GPU
+                # new token on the same stream before Attention can read it.
+                self._host_layer_flat_row_indices[slot][stop] = 0
+                new_token_offsets.append(stop)
+                stop += 1
+            history_offset = stop
+        if self.cpu_flat_gather:
+            rows = self._host_layer_flat_row_indices[slot][:transfer_rows]
+            if self.gather_h2d_chunks:
+                # Disjoint slices of persistent pinned storage: CPU writes the
+                # next slice while the current stream transfers the previous.
+                # The existing slot completion event protects reuse next layer.
+                chunk_rows = max(1, (transfer_rows + self.gather_h2d_chunks - 1) // self.gather_h2d_chunks)
+                for chunk_start in range(0, transfer_rows, chunk_rows):
+                    chunk_stop = min(transfer_rows, chunk_start + chunk_rows)
+                    if self.cpu_run_gather:
+                        self._cpu_run_gather(self._host_key_rows, self._host_value_rows,
+                            rows[chunk_start:chunk_stop], host_flat_key[chunk_start:chunk_stop],
+                            host_flat_value[chunk_start:chunk_stop])
+                    else:
+                        torch.index_select(self._host_key_rows, 0, rows[chunk_start:chunk_stop],
+                                           out=host_flat_key[chunk_start:chunk_stop])
+                        torch.index_select(self._host_value_rows, 0, rows[chunk_start:chunk_stop],
+                                           out=host_flat_value[chunk_start:chunk_stop])
+                    def copy_chunk(start=chunk_start, stop=chunk_stop):
+                        self._gpu_layer_flat_attention_keys[start:stop, 0].copy_(host_flat_key[start:stop], non_blocking=True)
+                        self._gpu_layer_flat_attention_values[start:stop, 0].copy_(host_flat_value[start:stop], non_blocking=True)
+                    enqueue_started = time.perf_counter() if self.metrics_enabled else None
+                    self._record_copy('h2d', copy_chunk,
+                        2 * (chunk_stop-chunk_start) * self.geometry.head_dim * key_states[0].element_size(), copy_calls=2)
+                    if enqueue_started is not None:
+                        pipeline_enqueue_seconds += time.perf_counter() - enqueue_started
+                    pipeline_chunks += 1
+            elif self.cpu_native_gather:
+                self._cpu_kv_gather(self._host_key_rows,self._host_value_rows,rows,
+                                    host_flat_key[:transfer_rows],host_flat_value[:transfer_rows])
+            else:
+                torch.index_select(self._host_key_rows, 0, rows,
+                                   out=host_flat_key[:transfer_rows])
+                torch.index_select(self._host_value_rows, 0, rows,
+                                   out=host_flat_value[:transfer_rows])
+        if history_offset != transfer_rows:
+            raise AssertionError("GQA group history packing length mismatch")
+        if self.metrics_enabled:
+            self.metrics["host_gather_pack_wall_seconds"] += (
+                time.perf_counter() - phase_started - pipeline_enqueue_seconds
+            )
+            self.metrics["host_gather_layer_calls"] += 1
+            self.metrics["host_gather_primitive_calls"] += (1 if self.cpu_run_gather else 2) * pipeline_chunks if self.gather_h2d_chunks else (1 if self.cpu_native_gather else (2 if self.cpu_flat_gather else 2 * group_count))
+            self.metrics["host_gather_index_select_calls"] += (0 if self.cpu_run_gather else 2) * pipeline_chunks if self.gather_h2d_chunks else (0 if self.cpu_native_gather else (2 if self.cpu_flat_gather else 2 * group_count))
+            self.metrics["host_gather_index_concat_calls"] += 0
+            self.metrics["host_gather_index_temporary_allocations"] += 0
+            self.metrics["host_flat_pack_write_calls"] += 2 * group_count
+
+        assert self._gpu_layer_flat_history_keys is not None
+        assert self._gpu_layer_flat_history_values is not None
+        byte_count = (
+            2 * transfer_rows * self.geometry.head_dim * key_states[0].element_size()
+        )
+
+        def copy_layer_history() -> None:
+            target_key = (self._gpu_layer_flat_attention_keys[:, 0] if self.direct_attention_layout
+                          else self._gpu_layer_flat_history_keys)
+            target_value = (self._gpu_layer_flat_attention_values[:, 0] if self.direct_attention_layout
+                            else self._gpu_layer_flat_history_values)
+            target_key[:transfer_rows].copy_(
+                host_flat_key[:transfer_rows], non_blocking=True
+            )
+            target_value[:transfer_rows].copy_(
+                host_flat_value[:transfer_rows], non_blocking=True
+            )
+
+        phase_started = time.perf_counter() if self.metrics_enabled else None
+        if not self.gather_h2d_chunks:
+            self._record_copy("h2d", copy_layer_history, byte_count, copy_calls=2)
+        if self.metrics_enabled:
+            self.metrics["h2d_enqueue_wall_seconds"] += (
+                pipeline_enqueue_seconds if self.gather_h2d_chunks else time.perf_counter() - phase_started
+            )
+            self.metrics["layer_gqa_group_h2d_calls"] += 1
+            phase_started = time.perf_counter()
+        copied = self._event()
+        copied.record(torch.cuda.current_stream(self.device))
+        self._layer_flat_ready[slot] = copied
+
+        assert self._gpu_layer_flat_attention_keys is not None
+        assert self._gpu_layer_flat_attention_values is not None
+        key_segments: list[torch.Tensor] = []
+        value_segments: list[torch.Tensor] = []
+        history_offset = 0
+        for key, value, history_length in zip(
+            key_states, value_states, group_history_lengths
+        ):
+            stop = history_offset + history_length
+            key_segments.extend(
+                (self._gpu_layer_flat_history_keys[history_offset:stop], key[0, 0])
+            )
+            value_segments.extend(
+                (self._gpu_layer_flat_history_values[history_offset:stop], value[0, 0])
+            )
+            history_offset = stop
+        if self.direct_attention_layout:
+            for offset, key, value in zip(new_token_offsets, key_states, value_states):
+                self._gpu_layer_flat_attention_keys[offset:offset+1, 0].copy_(key[0, 0])
+                self._gpu_layer_flat_attention_values[offset:offset+1, 0].copy_(value[0, 0])
+        else:
+            torch.cat(
+                key_segments,
+                dim=0,
+                out=self._gpu_layer_flat_attention_keys[:total_attention, 0],
+            )
+            torch.cat(
+                value_segments,
+                dim=0,
+                out=self._gpu_layer_flat_attention_values[:total_attention, 0],
+            )
+        if cu_seqlens is None:
+            cu_seqlens = build_cu_seqlens()
+
+        for entry, new_length, key, value, total_length in zip(
+            entries, new_lengths, key_states, value_states, group_total_lengths
+        ):
+            self._last_query_head_lengths[entry] = (
+                total_length,
+            ) * self.num_query_heads_per_kv
+            self._schedule_d2h(entry, old_length, new_length, key, value)
+
+        if self.metrics_enabled:
+            self.metrics["append_and_d2h_enqueue_wall_seconds"] += (
+                time.perf_counter() - phase_started
+            )
+            self.metrics["cache_update_calls"] += group_count
+            self.metrics["layer_gqa_group_update_calls"] += 1
+            protected = min(self.sink_tokens, old_length) + min(
+                self.recent_tokens - 1,
+                max(0, old_length - min(self.sink_tokens, old_length)),
+            )
+            # Preserve the original per-Q visibility metric independently from
+            # the physical shared-union payload.
+            self.metrics["selected_history_tokens_total"] += per_q_history_total
+            self.metrics["selected_history_tokens_per_query_head"] += (
+                per_q_history_total / len(per_q_lengths)
+            ) * group_count
+            self.metrics["selected_adaptive_tokens_total"] += sum(
+                max(0, length - protected) for length in per_q_lengths
+            )
+            self.metrics["group_union_history_tokens_total"] += total_history
+            self.metrics["group_union_history_tokens_min_sum"] += min(
+                group_history_lengths
+            )
+            self.metrics["group_union_history_tokens_max_sum"] += max(
+                group_history_lengths
+            )
+            self.metrics["group_union_duplicate_rows_eliminated"] += (
+                per_q_history_total - total_history
+            )
+            self.metrics["group_attention_valid_tokens_total"] += total_attention
+            self.metrics["group_attention_logical_qk_tokens_total"] += sum(
+                length * self.num_query_heads_per_kv
+                for length in group_total_lengths
+            )
+            self.metrics["attention_valid_tokens_total"] += total_attention
+            self.metrics["attention_valid_tokens_min_sum"] += min(
+                group_total_lengths
+            )
+            self.metrics["attention_valid_tokens_max_sum"] += max(
+                group_total_lengths
+            )
+            assert update_started is not None
+            self.metrics["cache_update_total_wall_seconds"] += (
+                time.perf_counter() - update_started
+            )
+        return (
+            self._gpu_layer_flat_attention_keys[:total_attention],
+            self._gpu_layer_flat_attention_values[:total_attention],
+            cu_seqlens,
+            max(group_total_lengths),
+            group_total_lengths,
+        )
+
+    def state_snapshot(self) -> dict[str, Any]:
+        snapshot = super().state_snapshot()
+        quant_bytes = 0
+        for tensors in (
+            self._quant_key_packed,
+            self._quant_key_scale,
+            self._quant_key_minimum,
+        ):
+            quant_bytes += sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in tensors
+                if tensor is not None
+            )
+        snapshot.update(
+            {
+                "policy": (
+                    "twilight_inspired_int4_top_p_dynamic"
+                    if self.budget_mode == "dynamic"
+                    else "twilight_inspired_int4_top_p_matched_quest_h2d"
+                ),
+                "candidate_token_budget": self.candidate_token_budget,
+                "top_p": self.top_p,
+                "matched_budget_fraction": self.matched_budget_fraction,
+                "budget_mode": self.budget_mode,
+                "quantized_key_metadata_gpu_bytes": quant_bytes,
+                "official_twilight_kernel_used": False,
+                "qk_backend": self.qk_backend,
+                "cpu_flat_gather": self.cpu_flat_gather,
+                "cpu_bitmap_union": self.cpu_bitmap_union,
+                "cpu_native_gather": self.cpu_native_gather,
+                "direct_attention_layout": self.direct_attention_layout,
+                "early_gpu_metadata": self.early_gpu_metadata,
+                "gather_h2d_chunks": self.gather_h2d_chunks,
+                "reuse_quant_metadata": self.reuse_quant_metadata,
+                "fused_final_indices": self.fused_final_indices,
+                "fused_quest_score": self.fused_quest_score,
+                "skip_unused_host_views": self.skip_unused_host_views,
+                "cpu_run_gather": self.cpu_run_gather,
+                "skip_first_two_dense_layers": False,
+                "layer_batched_selection": self.layer_batched_selection,
+                "layer_batched_twilight_selection": self.layer_batched_selection,
+                "twilight_gqa_groupwise_execution": self.gqa_groupwise_execution,
+                "detailed_selection_profile": self.detailed_selection_profile,
+                "twilight_gqa_group_semantics": (
+                    "exact union of the original per-Query-head selected token sets"
+                    if self.gqa_groupwise_execution
+                    else None
+                ),
+            }
+        )
+        return snapshot
