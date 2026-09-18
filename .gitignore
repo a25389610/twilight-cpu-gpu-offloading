@@ -1,0 +1,32 @@
+# Python build and interpreter artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and model caches
+.venv/
+venv/
+.hf_cache/
+.hf_cache_access_check/
+
+# Generated experiment data: keep compact reports and configs in Git instead.
+results/
+logs/
+plots/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
