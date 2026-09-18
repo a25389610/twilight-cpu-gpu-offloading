@@ -1,0 +1,51 @@
+{
+  "selection_frozen_before_results": true,
+  "selection_date": "2026-08-10",
+  "reference_request_id": "evaluation__single_remote__narrative__i02",
+  "new_request_ids": [
+    "evaluation__sink_only__ledger__i02",
+    "evaluation__recent_only__packet__i02",
+    "evaluation__two_hop__narrative__i02"
+  ],
+  "selection_rationale": [
+    {
+      "request_id": "evaluation__sink_only__ledger__i02",
+      "task_family": "sink_only",
+      "template_id": "ledger",
+      "target_depth": 0.006,
+      "reason": "sink-boundary control using a structured ledger rather than Request 1 narrative remote retrieval"
+    },
+    {
+      "request_id": "evaluation__recent_only__packet__i02",
+      "task_family": "recent_only",
+      "template_id": "packet",
+      "target_depth": 0.96,
+      "reason": "recent-boundary control using a compact packet and the opposite retrieval depth extreme"
+    },
+    {
+      "request_id": "evaluation__two_hop__narrative__i02",
+      "task_family": "two_hop",
+      "template_id": "narrative",
+      "target_depth": 0.55,
+      "reason": "multi-step retrieval/reasoning pattern distinct from single_remote despite sharing the narrative layout"
+    }
+  ],
+  "frozen_protocols": {
+    "pair_score": "DemotionGain_i + PromotionGain_j",
+    "protocol_a": "Finite Pair-score Top-8",
+    "protocol_b": "Top-8 demotions x Top-8 promotions",
+    "static_full_heads": 112,
+    "static_short_heads": 112,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "metric": "Final Hidden-L2"
+  },
+  "planned_new_evaluations": {
+    "requests": 3,
+    "balanced_swaps_per_request": 12544,
+    "single_actions_per_request": 224,
+    "total_balanced_swaps": 37632,
+    "total_single_actions": 672,
+    "total": 38304
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "dataset": "SaylorTwift/RULER-32768-llama-3.2-tokenizer",
+  "revision": "e748e0cd1872b4bbaa6d5ed9c6fbcf6068951c42",
+  "requests": [],
+  "classification": "empty base used only to materialize the complete frozen x10 cohort"
+}

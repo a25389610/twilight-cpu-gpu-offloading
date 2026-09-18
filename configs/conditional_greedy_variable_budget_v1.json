@@ -1,0 +1,46 @@
+{
+  "protocol_frozen_before_new_results": true,
+  "freeze_date": "2026-08-14",
+  "classification": "development-only exact conditional-greedy variable-budget quality pilot",
+  "request_ids": [
+    "evaluation__single_remote__narrative__i02",
+    "evaluation__sink_only__ledger__i02",
+    "evaluation__recent_only__packet__i02",
+    "evaluation__two_hop__narrative__i02"
+  ],
+  "action": {
+    "initial_short_heads": 0,
+    "maximum_short_heads": 224,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "Final Hidden-L2",
+    "quality_budget": "same-Request canonical Static 112/112 Final Hidden-L2"
+  },
+  "selection": {
+    "candidate_set": "every currently-Full Head",
+    "candidate_evaluation": "actual combined mask with current Short set plus candidate",
+    "ordering": "lowest actual Final Hidden-L2 then stable entry ID",
+    "hard_guardrails": [
+      "task correctness",
+      "top-1 match with Full"
+    ],
+    "acceptance": "best feasible candidate Final Hidden-L2 <= frozen quality budget",
+    "stop": "no feasible candidate remains within the frozen quality budget"
+  },
+  "smoke": {
+    "request_count": 1,
+    "maximum_rounds": 5
+  },
+  "limits": {
+    "development_requests_not_pristine_test": true,
+    "teacher_reads_target_request_quality": true,
+    "path_dependent_not_global_optimum": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "quality_only_no_performance_claim": true,
+    "secondary_metrics_not_used_for_selection": [
+      "Output KL",
+      "DeltaNLL"
+    ]
+  }
+}

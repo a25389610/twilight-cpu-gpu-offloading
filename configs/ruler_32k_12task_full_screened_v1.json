@@ -1,0 +1,67 @@
+{
+  "protocol_frozen_before_results": true,
+  "freeze_date": "2026-08-16",
+  "classification": "12-task 32K RULER Full-screen-gated request-specific Offline Teacher study",
+  "model": "meta-llama/Llama-3.2-3B-Instruct",
+  "dataset": {
+    "repository": "SaylorTwift/RULER-32768-llama-3.2-tokenizer",
+    "revision": "e748e0cd1872b4bbaa6d5ed9c6fbcf6068951c42",
+    "classification": "third-party pregenerated official-format RULER rows pinned by immutable revision",
+    "candidate_row_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  },
+  "ruler": {
+    "repository": "https://github.com/NVIDIA/RULER",
+    "main_commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+    "max_seq_length_including_generation": 32768,
+    "model_template_type": "meta-llama3"
+  },
+  "tasks": [
+    {"name": "niah_single_1", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_single_2", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_single_3", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_multikey_1", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_multikey_2", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_multivalue", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "niah_multiquery", "family": "niah", "tokens_to_generate": 128, "scorer": "ruler_string_match_all", "answer_prefix_marker": " The speci"},
+    {"name": "vt", "family": "variable_tracking", "tokens_to_generate": 30, "scorer": "ruler_string_match_all", "answer_prefix_marker": "Answer: According to the chain(s)"},
+    {"name": "cwe", "family": "common_words_extraction", "tokens_to_generate": 120, "scorer": "ruler_string_match_all", "answer_prefix_marker": " Answer: T"},
+    {"name": "fwe", "family": "frequent_words_extraction", "tokens_to_generate": 50, "scorer": "ruler_string_match_all", "answer_prefix_marker": " Answer: A"},
+    {"name": "qa_1", "family": "question_answering", "tokens_to_generate": 32, "scorer": "ruler_string_match_part", "answer_prefix_marker": " Answer:"},
+    {"name": "qa_2", "family": "question_answering", "tokens_to_generate": 32, "scorer": "ruler_string_match_part", "answer_prefix_marker": " Answer:"}
+  ],
+  "action": {
+    "num_entries": 224,
+    "initial_short_heads": 0,
+    "maximum_short_heads": 224,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "first-decode-position cumulative Final Hidden-L2",
+    "candidate_set": "every currently-Full Head",
+    "ordering": "lowest actual Final Hidden-L2 then stable entry ID"
+  },
+  "generation": {
+    "do_sample": false,
+    "checkpoint_short_counts": [0, 32, 64, 96, 112, 128, 160, 192, 224],
+    "stop_at_eos": true
+  },
+  "screening_gate": {
+    "policy": "try pinned candidate rows in ascending index and run Full KV official scoring",
+    "required_full_ruler_score": 100.0,
+    "on_success": "run the complete 224-round Conditional Greedy path and TPOT repetitions",
+    "on_exhaustion": "preserve all screening failures and report no qualifying request"
+  },
+  "tpot": {
+    "short_head_counts": [0, 32, 64, 96, 112, 128, 160, 192, 224],
+    "decode_steps": 128,
+    "repetitions": 3,
+    "order_seed": 20260816,
+    "primary_interval": "D2-D128"
+  },
+  "limits": {
+    "full_correct_conditioned_cases_not_unfiltered_benchmark_accuracy": true,
+    "screening_failures_retained_in_denominator": true,
+    "request_specific_offline_oracle_not_predictor": true,
+    "first_decode_proxy_not_answer_span_teacher": true,
+    "third_party_rows_not_official_nvidia_dataset_release": true
+  }
+}

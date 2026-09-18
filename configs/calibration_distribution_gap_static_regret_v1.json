@@ -1,0 +1,57 @@
+{
+  "protocol_frozen_before_results": true,
+  "freeze_date": "2026-08-10",
+  "classification": "paired 15-Request calibration-distribution-gap diagnostic; existing evaluation split is diagnostic, not pristine final test",
+  "evaluation_selection": {
+    "dataset_split": "test",
+    "instance_id": 3,
+    "expected_request_count": 15,
+    "expected_coverage": "5 task families x 3 templates"
+  },
+  "calibration_regimes": [
+    "id_full_30",
+    "id_size20",
+    "template_ood_20",
+    "id_size24",
+    "family_ood_24"
+  ],
+  "id_size20_extra_i01": [
+    "calibration__multi_key__ledger__i01",
+    "calibration__recent_only__narrative__i01",
+    "calibration__single_remote__packet__i01",
+    "calibration__sink_only__ledger__i01",
+    "calibration__two_hop__narrative__i01"
+  ],
+  "id_size24_extra_i01": [
+    "calibration__multi_key__ledger__i01",
+    "calibration__multi_key__narrative__i01",
+    "calibration__recent_only__narrative__i01",
+    "calibration__recent_only__packet__i01",
+    "calibration__single_remote__packet__i01",
+    "calibration__single_remote__ledger__i01",
+    "calibration__sink_only__ledger__i01",
+    "calibration__sink_only__narrative__i01",
+    "calibration__two_hop__packet__i01"
+  ],
+  "size_control_base": "all 15 calibration i00 requests plus the listed i01 requests",
+  "policies": {
+    "strong_static": "mean calibration-only single-head Hidden-L2 Top-112",
+    "teacher": "Static-centered recomputed finite Top-8 demotions x Top-8 promotions with no-op",
+    "query_nn": "nearest calibration Query feature, then source-request Hidden-L2 Top-112",
+    "final_hidden_nn": "nearest calibration Final hidden feature, then source-request Hidden-L2 Top-112"
+  },
+  "action": {
+    "full_heads": 112,
+    "short_heads": 112,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "Final Hidden-L2"
+  },
+  "limits": {
+    "no_predictor_training": true,
+    "no_evaluation_label_in_static_or_nn": true,
+    "no_k_or_formula_search": true,
+    "no_partial_h2d": true,
+    "teacher_leaked_only_for_evaluation_upper_bound": true
+  }
+}

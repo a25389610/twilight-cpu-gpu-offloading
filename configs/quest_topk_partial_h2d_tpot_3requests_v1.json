@@ -1,0 +1,24 @@
+{
+  "study": "Quest-style fixed 5% Top-K block true Partial-H2D TPOT pilot",
+  "classification": "preliminary three-request systems measurement; not Fluxion reproduction",
+  "requests": [
+    "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/001_niah_single_1_i011/teacher/requests/ruler__niah_single_1__hf_e748e0c__i011",
+    "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/017_niah_multikey_3_i013/teacher/requests/ruler__niah_multikey_3__hf_e748e0c__i013",
+    "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/026_vt_i000/teacher/requests/ruler__vt__hf_e748e0c__i000"
+  ],
+  "round_orders": [
+    [0, 1, 2],
+    [2, 1, 0],
+    [1, 0, 2]
+  ],
+  "decode_steps": 128,
+  "primary_interval": "D2-D128",
+  "fixed_token_id": 1,
+  "synchronize_each_token": true,
+  "block_size": 16,
+  "budget_fraction": 0.05,
+  "sink_tokens": 64,
+  "recent_tokens": 256,
+  "repetitions_per_request": 3,
+  "correctness_gate": "P4/D1/D2 logits bit-exact against GPU-resident Quest reference"
+}

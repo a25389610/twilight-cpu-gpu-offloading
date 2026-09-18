@@ -1,0 +1,46 @@
+{
+  "study": "Quest Selection Frequency five-request pilot",
+  "model": "meta-llama/Llama-3.2-3B-Instruct",
+  "context": "32K",
+  "batch_size": 1,
+  "selection_intervals": [1, 2, 4, 8, 16, 32],
+  "quest": {
+    "block_size": 16,
+    "budget_fraction": 0.05,
+    "sink_tokens": 64,
+    "recent_tokens": 256
+  },
+  "requests": [
+    {
+      "sequence": 1,
+      "task": "niah_single_1",
+      "request_dir": "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/001_niah_single_1_i011/teacher/requests/ruler__niah_single_1__hf_e748e0c__i011"
+    },
+    {
+      "sequence": 17,
+      "task": "niah_multikey_3",
+      "request_dir": "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/017_niah_multikey_3_i013/teacher/requests/ruler__niah_multikey_3__hf_e748e0c__i013"
+    },
+    {
+      "sequence": 26,
+      "task": "vt",
+      "request_dir": "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/026_vt_i000/teacher/requests/ruler__vt__hf_e748e0c__i000"
+    },
+    {
+      "sequence": 32,
+      "task": "fwe",
+      "request_dir": "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/032_fwe_i013/teacher/requests/ruler__fwe__hf_e748e0c__i013"
+    },
+    {
+      "sequence": 35,
+      "task": "qa_1",
+      "request_dir": "results/ruler_32k_13task_x3_unfiltered_exact224_v1/requests/035_qa_1_i009/teacher/requests/ruler__qa_1__hf_e748e0c__i009"
+    }
+  ],
+  "tpot": {
+    "decode_steps": 128,
+    "primary_interval": "D2-D128",
+    "fresh_repetitions_per_interval_request": 1,
+    "diagnostic_tokens_after_tpot": 32
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "protocol_frozen_before_execution": true,
+  "classification": "10-held-out Exact-budget Joint Gate aggregation aligned to Global Teacher v1",
+  "request_ids": [
+    "gt_evaluation__sink_only__briefing__i01",
+    "gt_evaluation__sink_only__tagged__i01",
+    "gt_evaluation__recent_only__briefing__i01",
+    "gt_evaluation__recent_only__tagged__i01",
+    "gt_evaluation__single_remote__briefing__i01",
+    "gt_evaluation__single_remote__tagged__i01",
+    "gt_evaluation__multi_key__briefing__i01",
+    "gt_evaluation__multi_key__tagged__i01",
+    "gt_evaluation__two_hop__briefing__i01",
+    "gt_evaluation__two_hop__tagged__i01"
+  ],
+  "protocol": {
+    "context_length": 2048,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "full_head_budget": 112,
+    "short_head_budget": 112,
+    "gate_initialization": 0.5,
+    "gate_sum": 112.0,
+    "optimizer": "AdamW",
+    "learning_rate": 0.02,
+    "weight_decay": 0.0,
+    "regularization_weight": 0.0,
+    "projection": "capped simplex after every optimizer step",
+    "steps": 128,
+    "checkpoints": [8, 16, 32, 64, 128],
+    "seed": 20260726,
+    "teacher_target": "same-Request Full final hidden state",
+    "primary_metric": "Final Hidden-L2"
+  },
+  "aggregation": {
+    "unit": "Request",
+    "main_result": "mean metrics at each predeclared checkpoint",
+    "static_target_mean": 5.242536187171936,
+    "no_checkpoint_selection_on_heldout": true
+  },
+  "limits": {
+    "no_hyperparameter_search": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "preserve_original_single_request_artifacts": true
+  }
+}

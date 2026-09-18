@@ -1,0 +1,120 @@
+{
+  "protocol_frozen_before_new_results": true,
+  "freeze_date": "2026-08-10",
+  "classification": "fresh 10-calibration plus 10-held-out frozen non-static Global Teacher generalization",
+  "request_ids": [
+    "gt_calibration__sink_only__briefing__i00",
+    "gt_evaluation__sink_only__briefing__i01",
+    "gt_calibration__sink_only__tagged__i00",
+    "gt_evaluation__sink_only__tagged__i01",
+    "gt_calibration__recent_only__briefing__i00",
+    "gt_evaluation__recent_only__briefing__i01",
+    "gt_calibration__recent_only__tagged__i00",
+    "gt_evaluation__recent_only__tagged__i01",
+    "gt_calibration__single_remote__briefing__i00",
+    "gt_evaluation__single_remote__briefing__i01",
+    "gt_calibration__single_remote__tagged__i00",
+    "gt_evaluation__single_remote__tagged__i01",
+    "gt_calibration__multi_key__briefing__i00",
+    "gt_evaluation__multi_key__briefing__i01",
+    "gt_calibration__multi_key__tagged__i00",
+    "gt_evaluation__multi_key__tagged__i01",
+    "gt_calibration__two_hop__briefing__i00",
+    "gt_evaluation__two_hop__briefing__i01",
+    "gt_calibration__two_hop__tagged__i00",
+    "gt_evaluation__two_hop__tagged__i01"
+  ],
+  "calibration_request_ids": [
+    "gt_calibration__sink_only__briefing__i00",
+    "gt_calibration__sink_only__tagged__i00",
+    "gt_calibration__recent_only__briefing__i00",
+    "gt_calibration__recent_only__tagged__i00",
+    "gt_calibration__single_remote__briefing__i00",
+    "gt_calibration__single_remote__tagged__i00",
+    "gt_calibration__multi_key__briefing__i00",
+    "gt_calibration__multi_key__tagged__i00",
+    "gt_calibration__two_hop__briefing__i00",
+    "gt_calibration__two_hop__tagged__i00"
+  ],
+  "heldout_request_ids": [
+    "gt_evaluation__sink_only__briefing__i01",
+    "gt_evaluation__sink_only__tagged__i01",
+    "gt_evaluation__recent_only__briefing__i01",
+    "gt_evaluation__recent_only__tagged__i01",
+    "gt_evaluation__single_remote__briefing__i01",
+    "gt_evaluation__single_remote__tagged__i01",
+    "gt_evaluation__multi_key__briefing__i01",
+    "gt_evaluation__multi_key__tagged__i01",
+    "gt_evaluation__two_hop__briefing__i01",
+    "gt_evaluation__two_hop__tagged__i01"
+  ],
+  "action": {
+    "full_heads": 112,
+    "short_heads": 112,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "Final Hidden-L2"
+  },
+  "raw_feature_scores": [
+    "full_short_output_delta_l2",
+    "single_head_hidden_l2",
+    "single_head_output_kl",
+    "long_range_attention"
+  ],
+  "proposal_scores": {
+    "output_delta_l2": ["full_short_output_delta_l2"],
+    "single_hidden_l2": ["single_head_hidden_l2"],
+    "single_output_kl": ["single_head_output_kl"],
+    "long_range_attention": ["long_range_attention"],
+    "action_pair_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2"],
+    "action_attention_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2", "long_range_attention"],
+    "all_feature_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2", "single_head_output_kl", "long_range_attention"]
+  },
+  "search": {
+    "initial_masks": "Top-112 of all seven predeclared proposal scores",
+    "beam_elites": 4,
+    "generations": 4,
+    "balanced_swap_sizes": [1, 2, 4],
+    "rank_offsets": [0, 1],
+    "maximum_unique_candidates_per_generation": 96,
+    "candidate_order": "offset then swap size then guide then elite; stable entry-ID tie break",
+    "selection": "lowest actual Final Hidden-L2; stable mask tuple tie break"
+  },
+  "fixed_mask_control": {
+    "candidate_masks": "ten calibration self-Teacher masks only",
+    "selection": "lowest mean Final Hidden-L2 across ten calibration targets",
+    "heldout_use": "selected mask applied unchanged to all ten held-out Requests",
+    "cross_transfer": "all calibration masks and all held-out Teacher masks evaluated on all held-out targets"
+  },
+  "success_criteria": {
+    "self_teacher_hidden_wins_vs_canonical_static_min": 8,
+    "self_teacher_hidden_wins_vs_calibration_fixed_min": 7,
+    "self_teacher_mean_hidden_relative_reduction_vs_each_fixed_min": 0.10,
+    "self_teacher_correctness_required": 10,
+    "output_delta_hidden_wins_vs_canonical_static_min": 7,
+    "secondary_alert": "report if mean KL or mean DeltaNLL is worse than canonical Static or fewer than 5 of 10 improve"
+  },
+  "baselines": {
+    "canonical_static": "original 30-calibration Hidden-L2 Top-112",
+    "calibration_fixed_teacher": "chosen without held-out quality",
+    "output_delta_l2": "fixed predeclared rich-feature Top-112",
+    "random_search": "intentionally omitted by user decision"
+  },
+  "integrity": {
+    "hash_each_request": false,
+    "model_hash_policy": "once after lazy initialization and once after all Requests"
+  },
+  "cost_estimate": {
+    "expected_wall_time_minutes": [8.0, 12.0]
+  },
+  "limits": {
+    "no_heldout_tuning": true,
+    "static_is_not_an_initial_mask": true,
+    "static_is_not_an_elite": true,
+    "no_random_masks_or_mutations": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "not_a_global_optimum": true,
+    "hidden_l2_only_teacher_selection": true
+  }
+}

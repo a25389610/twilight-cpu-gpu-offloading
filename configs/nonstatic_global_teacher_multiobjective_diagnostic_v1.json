@@ -1,0 +1,65 @@
+{
+  "protocol_frozen_before_candidate_archive_results": true,
+  "freeze_date": "2026-08-11",
+  "classification": "calibration-only candidate Pareto and multi-objective feasibility diagnostic",
+  "source_teacher_config": "configs/nonstatic_global_teacher_generalization_v1.json",
+  "request_scope": "ten calibration Requests only",
+  "search_replay": {
+    "features": "all four existing privileged features",
+    "proposal_scores": "unchanged seven proposal scores",
+    "beam_elites": 4,
+    "generations": 4,
+    "balanced_swap_sizes": [1, 2, 4],
+    "rank_offsets": [0, 1],
+    "maximum_unique_candidates_per_generation": 96,
+    "selection": "existing Final Hidden-L2-only rule",
+    "required_reproduction": "final mask exact and all three metrics within 1e-6 of the prior calibration Teacher artifact"
+  },
+  "candidate_archive": {
+    "save_every_unique_evaluated_nonstatic_mask": true,
+    "fields": [
+      "mask_sha256",
+      "full_heads",
+      "origin",
+      "Final Hidden-L2",
+      "Output KL",
+      "DeltaNLL",
+      "correctness"
+    ],
+    "static_is_comparison_only": true,
+    "no_random_search": true
+  },
+  "pareto": {
+    "objectives": [
+      "minimize Final Hidden-L2",
+      "minimize Output KL",
+      "minimize DeltaNLL"
+    ],
+    "correctness_required": true,
+    "hidden_relative_epsilon_schedule": [0.0, 0.01, 0.02, 0.05, 0.1],
+    "epsilon_candidate_rule": "among correct candidates within epsilon of the per-Request Hidden-best, require Output KL no worse than the same Request Static plus 1e-6, then choose minimum DeltaNLL with KL, Hidden-L2, and mask hash tie breaks",
+    "kl_static_tolerance": 0.000001
+  },
+  "balanced_go_criteria": {
+    "maximum_selected_hidden_epsilon": 0.05,
+    "feasible_requests_required": 10,
+    "mean_DeltaNLL_no_worse_than_Static": true,
+    "DeltaNLL_wins_vs_Static_min": 5,
+    "Hidden_L2_wins_vs_Static_min": 8,
+    "Output_KL_wins_vs_Static_min": 8,
+    "correctness_required": 10,
+    "selection": "smallest epsilon satisfying every criterion"
+  },
+  "stop_rule": {
+    "if_no_epsilon_passes": "stop before Guarded Teacher v2, feature ablation, and PPL bridge",
+    "if_an_epsilon_passes": "freeze the smallest passing epsilon as Guarded Teacher v2 before feature ablation"
+  },
+  "limits": {
+    "no_heldout_threshold_tuning": true,
+    "no_feature_ablation_before_objective_gate": true,
+    "no_weighted_metric_sum": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "current_DeltaNLL_is_single_answer_position_semantic_NLL_not_corpus_PPL": true
+  }
+}

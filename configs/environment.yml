@@ -1,0 +1,16 @@
+name: headinfer_repro
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch==2.7.0+cu128
+      - torchvision==0.22.0+cu128
+      - transformers==4.45.2
+      - accelerate==1.7.0
+      - safetensors==0.5.3
+      - huggingface_hub==0.30.2
+      - psutil==7.0.0
+      - matplotlib==3.10.3
+      - -e ./source/headinfer

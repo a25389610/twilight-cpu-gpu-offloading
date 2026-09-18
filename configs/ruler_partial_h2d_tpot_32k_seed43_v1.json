@@ -1,0 +1,47 @@
+{
+  "protocol_frozen_before_results": true,
+  "freeze_date": "2026-08-16",
+  "classification": "single-request 32K seed43 Full-screened RULER true Partial-H2D TPOT case",
+  "model": "meta-llama/Llama-3.2-3B-Instruct",
+  "request_artifacts": "results/ruler_conditional_greedy_teacher_32k_seed43_v1_niah_multikey3_i0/requests/ruler__niah_multikey_3__seed43__i000",
+  "request_id": "ruler__niah_multikey_3__seed43__i000",
+  "prompt_token_count": 32553,
+  "short_head_counts": [0, 32, 64, 96, 112, 128, 160, 192, 224],
+  "mask_source": "prefixes of the frozen 224-entry request-specific Conditional Greedy path",
+  "cache": {
+    "full_policy": "GroupedPinnedSlabOffloadedCache full historical H2D",
+    "partial_policy": "StaticHeadwiseShortWindowOffloadedCache",
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "transfer_group_size": 1,
+    "writeback_mode": "delta",
+    "activation_wait_mode": "event",
+    "host_history": "full for every entry"
+  },
+  "timing": {
+    "batch_size": 1,
+    "decode_policy": "fixed token ID 1",
+    "decode_steps": 128,
+    "primary_tpot_interval": "D2-D128",
+    "exclude_d1_as_warmup": true,
+    "cuda_and_cache_synchronize_each_token": true,
+    "repetitions": 3,
+    "order_seed": 20260816,
+    "prefill_excluded": true,
+    "model_load_excluded": true
+  },
+  "quality_join": {
+    "source": "saved greedy generation checkpoints from the same request and masks",
+    "metric": "official RULER string_match_all",
+    "quality_and_tpot_are_separate_runs": true,
+    "full_baseline_accuracy": 100,
+    "quality_budget_selection_valid": true
+  },
+  "limits": {
+    "single_request": true,
+    "full_correct_conditioned_case": true,
+    "request_specific_offline_oracle_masks": true,
+    "not_predictor_latency": true,
+    "not_cross_task_accuracy": true
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "protocol_frozen_before_ablation_results": true,
+  "freeze_date": "2026-08-11",
+  "classification": "calibration-only controlled privileged-feature necessity ablation",
+  "source_teacher_config": "configs/nonstatic_global_teacher_generalization_v1.json",
+  "source_multiobjective_protocol": "configs/nonstatic_global_teacher_multiobjective_diagnostic_v1.json",
+  "guarded_teacher_v2": {
+    "selected_calibration_epsilon": 0.05,
+    "correctness_required": true,
+    "per_Request_hidden_limit": "candidate Hidden-L2 <= 1.05 times that variant per-Request Hidden-best",
+    "per_Request_KL_guard": "candidate Output KL <= same-Request canonical Static Output KL + 1e-6",
+    "selection": "minimum DeltaNLL, then KL, Hidden-L2, mask hash",
+    "no_weighted_metric_sum": true
+  },
+  "controlled_search": {
+    "one_initial_proposal_per_variant": true,
+    "proposal": "equal mean of deterministic descending rank scores for included raw features",
+    "beam_elites": 4,
+    "generations": 4,
+    "balanced_swap_sizes": [1, 2, 4],
+    "rank_offsets": [0, 1, 2, 3, 4, 5, 6, 7],
+    "maximum_unique_candidates_per_generation": 96,
+    "candidate_selection_during_search": "unchanged Final Hidden-L2-only beam",
+    "post_search_label_selection": "Guarded Teacher v2",
+    "random_search": false
+  },
+  "raw_feature_aliases": {
+    "O": "full_short_output_delta_l2",
+    "H": "single_head_hidden_l2",
+    "K": "single_head_output_kl",
+    "L": "long_range_attention"
+  },
+  "variants": {
+    "full_OHKL": ["O", "H", "K", "L"],
+    "minus_O_HKL": ["H", "K", "L"],
+    "minus_H_OKL": ["O", "K", "L"],
+    "minus_K_OHL": ["O", "H", "L"],
+    "minus_L_OHK": ["O", "H", "K"],
+    "only_O": ["O"],
+    "only_H": ["H"],
+    "minimal_OH": ["O", "H"]
+  },
+  "necessity_rules": {
+    "full_variant_reference": "full_OHKL",
+    "feature_is_necessary_if_leave_one_out": "Balanced-Go fails, any Request lacks a feasible mask, or mean Hidden-L2 is more than 5 percent worse than full_OHKL",
+    "subset_is_sufficient_if": "Balanced-Go passes, 10 of 10 Requests are feasible and correct, and mean Hidden-L2 is no more than 5 percent worse than full_OHKL",
+    "minimal_subset_selection": "fewest raw features among sufficient subsets, then lowest mean Hidden-L2, then variant name",
+    "balanced_go_reuses_multiobjective_rules": true
+  },
+  "limits": {
+    "calibration_requests_only": true,
+    "no_heldout_feature_selection": true,
+    "excluded_features_not_used_by_proposal_or_search": true,
+    "excluded_features_may_still_be_captured_for_common_invariance_path": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "no_random_search": true
+  }
+}

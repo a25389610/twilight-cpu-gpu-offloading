@@ -1,0 +1,56 @@
+{
+  "protocol_frozen_before_new_results": true,
+  "freeze_date": "2026-08-10",
+  "classification": "four-Request development-only non-static rich-feature Global Teacher pilot",
+  "request_ids": [
+    "evaluation__single_remote__narrative__i02",
+    "evaluation__sink_only__ledger__i02",
+    "evaluation__recent_only__packet__i02",
+    "evaluation__two_hop__narrative__i02"
+  ],
+  "action": {
+    "full_heads": 112,
+    "short_heads": 112,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "Final Hidden-L2"
+  },
+  "raw_feature_scores": [
+    "full_short_output_delta_l2",
+    "single_head_hidden_l2",
+    "single_head_output_kl",
+    "long_range_attention"
+  ],
+  "proposal_scores": {
+    "output_delta_l2": ["full_short_output_delta_l2"],
+    "single_hidden_l2": ["single_head_hidden_l2"],
+    "single_output_kl": ["single_head_output_kl"],
+    "long_range_attention": ["long_range_attention"],
+    "action_pair_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2"],
+    "action_attention_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2", "long_range_attention"],
+    "all_feature_rank_fusion": ["full_short_output_delta_l2", "single_head_hidden_l2", "single_head_output_kl", "long_range_attention"]
+  },
+  "search": {
+    "initial_masks": "Top-112 of all seven predeclared proposal scores",
+    "beam_elites": 4,
+    "generations": 4,
+    "balanced_swap_sizes": [1, 2, 4],
+    "rank_offsets": [0, 1],
+    "maximum_unique_candidates_per_generation": 96,
+    "candidate_order": "offset then swap size then guide then elite; stable entry-ID tie break",
+    "selection": "lowest actual Final Hidden-L2; stable mask tuple tie break"
+  },
+  "baselines": {
+    "strong_static": "calibration-only canonical Hidden-L2 Top-112; comparison only",
+    "random_search": "intentionally omitted by user decision"
+  },
+  "limits": {
+    "static_is_not_an_initial_mask": true,
+    "static_is_not_an_elite": true,
+    "no_random_masks_or_mutations": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "not_a_global_optimum": true,
+    "development_requests_not_pristine_test": true
+  }
+}

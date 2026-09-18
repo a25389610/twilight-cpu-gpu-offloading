@@ -1,0 +1,56 @@
+{
+  "protocol_frozen_before_new_results": true,
+  "freeze_date": "2026-08-16",
+  "classification": "single-request 8K RULER request-specific Offline Teacher context-sweep case",
+  "model": "meta-llama/Llama-3.2-3B-Instruct",
+  "ruler": {
+    "repository": "https://github.com/NVIDIA/RULER",
+    "main_commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+    "task": "niah_multikey_3",
+    "task_family": "niah",
+    "sample_index": 0,
+    "random_seed": 42,
+    "max_seq_length_including_generation": 8192,
+    "tokens_to_generate": 128,
+    "model_template_type": "meta-llama3",
+    "scorer": "official string_match_all"
+  },
+  "action": {
+    "num_entries": 224,
+    "initial_short_heads": 0,
+    "maximum_short_heads": 224,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "first-decode-position cumulative Final Hidden-L2",
+    "candidate_set": "every currently-Full Head",
+    "ordering": "lowest actual Final Hidden-L2 then stable entry ID",
+    "quality_stop": null
+  },
+  "generation": {
+    "do_sample": false,
+    "checkpoint_short_counts": [
+      0,
+      32,
+      64,
+      96,
+      112,
+      128,
+      160,
+      192,
+      224
+    ],
+    "stop_at_eos": true
+  },
+  "smoke": {
+    "maximum_rounds": 5
+  },
+  "limits": {
+    "single_request_per_context_length": true,
+    "teacher_reads_target_request_full_kv": true,
+    "request_specific_offline_oracle_not_predictor": true,
+    "first_decode_proxy_not_answer_span_teacher": true,
+    "no_predictor_training": true,
+    "no_partial_h2d": true,
+    "quality_path_generation_timing_not_tpot_claim": true
+  }
+}

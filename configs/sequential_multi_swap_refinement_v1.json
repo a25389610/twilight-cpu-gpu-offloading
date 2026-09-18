@@ -1,0 +1,41 @@
+{
+  "protocol_frozen_before_new_results": true,
+  "freeze_date": "2026-08-10",
+  "classification": "four-Request development-only sequential multi-swap diagnostic",
+  "request_ids": [
+    "evaluation__single_remote__narrative__i02",
+    "evaluation__sink_only__ledger__i02",
+    "evaluation__recent_only__packet__i02",
+    "evaluation__two_hop__narrative__i02"
+  ],
+  "action": {
+    "full_heads": 112,
+    "short_heads": 112,
+    "sink_tokens": 64,
+    "recent_tokens": 256,
+    "primary_metric": "Final Hidden-L2",
+    "maximum_distinct_swaps_from_static": 4
+  },
+  "teacher": {
+    "single_actions_recomputed_each_round": true,
+    "candidate_protocol": "Top-8 eligible demotions x Top-8 eligible promotions",
+    "pair_score": "DemotionGain_i + PromotionGain_j",
+    "used_original-Static_head_identities_are_not_reused": true,
+    "forced_k_curve": true,
+    "best_so_far_curve_includes_no_op": true
+  },
+  "round_2_validation": {
+    "ground_truth": "complete 112 x 112 one-swap neighborhood around exhaustive-best M1; recovery denominator filters to unused original-Static identities",
+    "reference_request_round_2_artifact_reused": true,
+    "new_exhaustive_request_count": 3,
+    "pass_rule": "at least 3 of 4 Requests recover >= 90% of the best eligible second-swap gain",
+    "stop_if_failed": true
+  },
+  "limits": {
+    "no_predictor_training": true,
+    "no_query_or_hidden_features": true,
+    "no_partial_h2d": true,
+    "no_hyperparameter_or_k_search": true,
+    "not_a_global_oracle": true
+  }
+}
