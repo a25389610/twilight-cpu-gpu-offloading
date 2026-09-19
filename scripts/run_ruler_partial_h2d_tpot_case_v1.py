@@ -77,6 +77,21 @@ def parse_args() -> argparse.Namespace:
         help="Diagnostic-only exact comparison against the original per-Q CPU union.",
     )
     parser.add_argument(
+        "--twilight-batched-new-kv-d2h",
+        action="store_true",
+        help="Batch decode new-K/V writeback; default-off execution ablation.",
+    )
+    parser.add_argument(
+        "--twilight-new-kv-d2h-granularity",
+        choices=("layer", "token"),
+        default="token",
+    )
+    parser.add_argument(
+        "--capture-twilight-new-kv-trace",
+        action="store_true",
+        help="Diagnostic-only per-step/layer/KV-head CPU slab hashes.",
+    )
+    parser.add_argument(
         "--capture-twilight-resident-attention-trace",
         action="store_true",
         help="Diagnostic-only exact attention K/V hashes at D1, D2, and D32.",
@@ -455,6 +470,14 @@ def main() -> int:
         and not args.twilight_gpu_compact_gqa_union
     ):
         raise ValueError("GPU union validation requires GPU compact union")
+    if args.twilight_batched_new_kv_d2h and not (
+        args.twilight_top_p is not None
+        and args.twilight_gqa_group
+        and args.quest_layer_batched_selection
+    ):
+        raise ValueError("batched new-KV D2H requires layer-batched Twilight GQA")
+    if args.capture_twilight_new_kv_trace and args.twilight_top_p is None:
+        raise ValueError("new-KV trace requires Twilight")
     if (
         args.capture_twilight_resident_attention_trace
         and not args.twilight_gqa_group
@@ -589,6 +612,8 @@ def main() -> int:
             ),
             gpu_compact_gqa_union=args.twilight_gpu_compact_gqa_union,
             gpu_union_validate_cpu=args.twilight_gpu_union_validate_cpu,
+            batched_new_kv_d2h=args.twilight_batched_new_kv_d2h,
+            new_kv_d2h_granularity=args.twilight_new_kv_d2h_granularity,
             sparse_gather_stabilized=args.sparse_gather_stabilized,
             per_head_varlen_attention_reference=(
                 args.twilight_per_head_varlen_reference
@@ -600,6 +625,8 @@ def main() -> int:
             cache.enable_budget_trace()
         if args.capture_twilight_resident_attention_trace:
             cache.enable_resident_attention_trace()
+        if args.capture_twilight_new_kv_trace:
+            cache.enable_new_kv_trace()
         h2d_policy = (
             "twilight_int4_top_p_dynamic_gqa_group_union"
             if args.twilight_budget_mode == "dynamic" and args.twilight_gqa_group
@@ -1095,6 +1122,21 @@ def main() -> int:
         "twilight_gpu_union_validate_cpu": (
             args.twilight_gpu_union_validate_cpu
             if args.twilight_top_p is not None
+            else None
+        ),
+        "twilight_batched_new_kv_d2h": (
+            args.twilight_batched_new_kv_d2h
+            if args.twilight_top_p is not None
+            else None
+        ),
+        "twilight_new_kv_d2h_granularity": (
+            args.twilight_new_kv_d2h_granularity
+            if args.twilight_batched_new_kv_d2h
+            else None
+        ),
+        "twilight_new_kv_trace": (
+            cache.new_kv_trace()
+            if args.capture_twilight_new_kv_trace
             else None
         ),
         "resident_diagnostic_only": bool(
