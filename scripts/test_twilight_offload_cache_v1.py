@@ -28,6 +28,9 @@ def make_selection_cache(
     flat: bool = False,
     stabilized: bool = False,
     gqa_group: bool = False,
+    direct: bool = False,
+    resident: bool = False,
+    gpu_union: bool = False,
 ) -> TwilightMatchedBudgetOffloadedCache:
     cache = TwilightMatchedBudgetOffloadedCache(
         num_cache_entries=2,
@@ -46,6 +49,12 @@ def make_selection_cache(
         layer_flat_ragged_execution=flat,
         sparse_gather_stabilized=stabilized,
         gqa_groupwise_execution=gqa_group,
+        cpu_flat_gather=direct,
+        direct_attention_layout=direct,
+        gather_h2d_chunks=2 if direct else 0,
+        previous_token_resident_cache=resident,
+        gpu_compact_gqa_union=gpu_union,
+        gpu_union_validate_cpu=gpu_union,
     )
     torch.manual_seed(1234)
     cache._prompt_length = 16
@@ -338,6 +347,87 @@ def main() -> int:
             expected_per_q_history - expected_history
         )
         assert grouped.selection_trace() == reference.selection_trace()
+
+        # GPU membership handoff must preserve the exact sorted group union,
+        # per-Q trace, gathered K/V, and attention metadata.
+        gpu_grouped = make_selection_cache(
+            p=0.85,
+            batched=True,
+            mode="dynamic",
+            gqa_group=True,
+            gpu_union=True,
+        )
+        populate_host_cache(gpu_grouped)
+        gpu_grouped.enable_metrics()
+        gpu_grouped.prepare_layer_selection(entries=[0, 1], queries=queries)
+        gpu_outputs = gpu_grouped.update_layer_gqa_group_ragged(
+            key_states=current_keys,
+            value_states=current_values,
+            queries=queries,
+            entries=[0, 1],
+        )
+        gpu_grouped.synchronize()
+        for index in range(3):
+            assert torch.equal(gpu_outputs[index], (group_key, group_value, group_cu_k)[index])
+        assert gpu_outputs[3:] == (group_max_k, group_lengths)
+        assert gpu_grouped.selection_trace() == grouped.selection_trace()
+        assert gpu_grouped.group_union_trace() == grouped.group_union_trace()
+        gpu_metrics = gpu_grouped.resolve_metrics()
+        assert gpu_metrics["h2d_bytes"] == grouped_metrics["h2d_bytes"]
+        assert gpu_metrics["twilight_index_d2h_bytes"] > 0
+        assert gpu_grouped.state_snapshot()["gpu_group_membership_allocated_bytes"] > 0
+
+        # The previous-token resident prototype must preserve exact group
+        # positions, valid lengths, and assembled K/V across consecutive tokens.
+        direct_baseline = make_selection_cache(
+            p=0.85, batched=True, mode="dynamic", gqa_group=True, direct=True
+        )
+        resident = make_selection_cache(
+            p=0.85,
+            batched=True,
+            mode="dynamic",
+            gqa_group=True,
+            direct=True,
+            resident=True,
+        )
+        populate_host_cache(direct_baseline)
+        populate_host_cache(resident)
+        torch.manual_seed(1776)
+        for decode_step in (1, 2):
+            step_queries = [
+                torch.randn(1, 3, 1, 4, dtype=torch.bfloat16, device="cuda")
+                for _ in range(2)
+            ]
+            step_keys = [
+                torch.randn(1, 1, 1, 4, dtype=torch.bfloat16, device="cuda")
+                for _ in range(2)
+            ]
+            step_values = [torch.randn_like(key) for key in step_keys]
+            outputs = []
+            for cache in (direct_baseline, resident):
+                cache.prepare_layer_selection(entries=[0, 1], queries=step_queries)
+                outputs.append(
+                    cache.update_layer_gqa_group_ragged(
+                        key_states=step_keys,
+                        value_states=step_values,
+                        queries=step_queries,
+                        entries=[0, 1],
+                    )
+                )
+                cache.synchronize()
+            for index in range(3):
+                assert torch.equal(outputs[0][index], outputs[1][index])
+            assert outputs[0][3:] == outputs[1][3:]
+            assert direct_baseline.selected_positions_sha256() == (
+                resident.selected_positions_sha256()
+            )
+        reuse_rows = resident.resident_reuse_trace()
+        assert len(reuse_rows) == 2
+        assert reuse_rows[0]["hit_rows"] == 0
+        assert reuse_rows[1]["hit_rows"] > 0
+        assert reuse_rows[1]["hit_rows"] + reuse_rows[1]["miss_rows"] == (
+            reuse_rows[1]["history_rows"]
+        )
     print("twilight helper tests: PASS")
     return 0
 
