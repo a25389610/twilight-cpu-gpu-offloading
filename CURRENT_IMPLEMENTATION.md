@@ -1,12 +1,12 @@
 # CURRENT_IMPLEMENTATION
 
-這份文件只描述目前正式採用、用來取得約 140 ms/token 結果的 Twilight
-baseline。它不是歷史實驗清單，也不是研究進度報告；判定依據是實際
-runner command、case `result.json`、`manifest.json`、source snapshot 與
-正式 report。未列入目前 command 的選項，不應視為目前 execution path 的
-一部分。
+這份文件描述目前最新通過 exact correctness gate、三題 matched TPOT 都有
+正收益的 Twilight execution candidate。2026-09-20 版本在原約 140 ms/token
+baseline 上加入 default-off 的 GPU-side GQA union；runner 必須明確傳入
+`--twilight-gpu-compact-gqa-union` 才走新路徑。未傳入時仍完整保留舊 CPU
+union baseline，沒有默默改變預設行為。
 
-## 1. Baseline identity
+## 1. Current candidate identity
 
 | 項目 | 目前正式設定 |
 |---|---|
@@ -18,43 +18,45 @@ runner command、case `result.json`、`manifest.json`、source snapshot 與
 | Decode | fixed-token case（`fixed_token_id = 1`），`decode_steps = 32`，`D1` warm-up，正式 TPOT 取 `D2–D32` 共 31 tokens |
 | Head configuration | `short_head_count = 0`，`full_head_count = 224` |
 | Cache policy | sink `64`、recent `256`、Quest block size `16` |
-| 最新正式 TPOT | 三題 coarse mean **140.691 ms/token**；median **139.521 ms/token**；range **139.390–143.162 ms/token** |
-| 正式 report | [`reports/twilight_three_request_complete_2026-09-15.md`](reports/twilight_three_request_complete_2026-09-15.md) |
-| 主要 artifact | `results/twilight_three_requests_20260915/manifest.json`、各 request 的 `latest/coarse/result.json` |
+| 最新 matched TPOT | 三題 93-token row-weighted mean **127.861 ms/token**；median **127.823 ms/token**；range **121.353–136.576 ms/token** |
+| Fresh matched control | mean **147.356 ms/token**；median **146.533 ms/token**；range **140.334–164.664 ms/token** |
+| 正式 report | [`reports/0923/twilight_gpu_compact_gqa_union_2026-09-20.md`](reports/0923/twilight_gpu_compact_gqa_union_2026-09-20.md) |
+| 主要 artifact | `results/twilight_gpu_compact_union_v1/formal_v2/`（local raw artifact，不上傳 GitHub） |
 
 TPOT 是 synchronized wall time per output token，排除 prefill/model load；
 不要把同一 run 的 `profile-breakdown` diagnostic wall 當成正式 TPOT。三題
-最新 coarse 結果為：
+新 GPU-union candidate 與同輪 fresh control 為：
 
-| request | D2–D32 mean |
-|---|---:|
-| `001_niah_multikey_3_i011` | 143.162 ms/token |
-| `002_vt_i002` | 139.390 ms/token |
-| `003_qa_1_i011` | 139.521 ms/token |
+| request | control | GPU union |
+|---|---:|---:|
+| `001_niah_multikey_3_i011` | 147.525 | 127.748 ms/token |
+| `002_vt_i002` | 144.361 | 126.656 ms/token |
+| `003_qa_1_i011` | 150.182 | 129.180 ms/token |
+
+三題 TPOT 下降 12.26–13.98%；overall TPOT 下降 **13.23%**，等價
+throughput speedup **15.25%**。historical 140.691 ms/token 只保留為舊
+baseline provenance，不作本輪分母。
 
 ## 2. Source snapshot and authoritative runner
 
-目前 public repository 的 source snapshot 是 commit `9d6316d`（後續的
-report/doc commits 不代表 production source 改變）。該 snapshot 的
-implementation 與本次 measured artifact 的 source hashes 對應；關鍵
-SHA-256 如下：
+本輪 source 以 local Git base
+`dee81b223e64cfc8b6bd58e36d9f8079bae58691` 加上 default-off 工作樹修改
+量測。public mirror 保存本輪實際 measured source；關鍵 SHA-256 如下：
 
 | source | SHA-256（manifest） |
 |---|---|
-| `source/headinfer/headinfer/twilight_offload_cache.py` | `ec57dd9117522d1023aa3840ae7145d8a8ad3036cff0ebe9a4e0d3f56fa5c908` |
+| `source/headinfer/headinfer/twilight_offload_cache.py` | `bf05ff5a43a9c43a9546a1658f35bc9cb6419ba7386282675a4104fb0ae19481` |
 | `source/headinfer/headinfer/mp.py` | `17cc266001bfa9fa0440ec8371d11cbe75db33cf11cee631d58e6593e5547806` |
 | `source/headinfer/headinfer/twilight_fused_qk.py` | `ed75777a4a7c7733341024bba3fc760c846d58f9ade96d0959a26eff840988e7` |
 | `source/headinfer/headinfer/twilight_fused_quest.py` | `6f44b412e6502ecc7c620511ce2f8f1652ace292539a0d679c2c0d07ba2c92e9` |
 | `source/headinfer/headinfer/cpu_token_union.py` | `bdd9afd7b158cccc28884c4125f28a7089a3759b8f27a57f18c12492c45f2edb` |
-| `scripts/run_ruler_partial_h2d_tpot_case_v1.py` | `4367fbee8789d6c28e9a258a6d06391ac18df07dba2cd9e27e1da373e0c26eba` |
+| `scripts/run_ruler_partial_h2d_tpot_case_v1.py` | `54f965918fa3dbe308631e251c2e3cc4774ec6cb13347a1e2b4f9dc6fb92623a` |
+| `scripts/run_twilight_gpu_compact_union_v1.py` | `d52089364d009e00a37344c9f839b4704105b72e4dcdff4632cc6f6a2c4ce576` |
 
-正式三題 orchestration runner 是 workspace 中的
-`scripts/run_twilight_three_requests_20260915.py`；它先從
-`results/twilight_gather_improvements_v1/manifest.json` 取得最新 command，
-再對三個 request 以 `latest` version 執行。`manifest.json` 的 command
-與 return code 是本 baseline 的 authoritative record。runner 另有
-`legacy_reconstructed` branch，但那一支會強制 `qk_backend=pytorch`、
-`gather_h2d_chunks=0` 並移除下列 flags，**不是本文件描述的 baseline**。
+正式 matched orchestration runner 是
+`scripts/run_twilight_gpu_compact_union_v1.py`。它固定三個 requests，交錯
+control/GPU-union 執行次序，保存 command、source SHA-256 與 return code；
+`manifest.json` 是本輪 authoritative record。
 
 目前 coarse case 的核心 command（path 以 artifact 中的 request/output
 替換）是：
@@ -63,7 +65,7 @@ SHA-256 如下：
 python scripts/run_ruler_partial_h2d_tpot_case_v1.py \
   --request-dir <timing_requests>/<request> \
   --short-head-count 0 --decode-steps 32 \
-  --profile-breakdown --profile-breakdown-steps 5 \
+  --profile-breakdown --profile-breakdown-steps 1 \
   --twilight-top-p 0.90 --twilight-budget-mode dynamic \
   --quest-layer-batched-selection --twilight-gqa-group \
   --twilight-qk-backend triton_prepare \
@@ -73,15 +75,16 @@ python scripts/run_ruler_partial_h2d_tpot_case_v1.py \
   --twilight-direct-attention-layout --twilight-layer-rope \
   --twilight-early-gpu-metadata --twilight-gather-h2d-chunks 4 \
   --twilight-reuse-quant-metadata --twilight-fused-quest-score \
-  --twilight-skip-unused-host-views
+  --twilight-skip-unused-host-views \
+  --twilight-gpu-compact-gqa-union
 ```
 
-`--profile-breakdown` 只在 TPOT 後額外量測 5 個 diagnostic tokens；它不
+`--profile-breakdown` 只在 TPOT 後額外量測 1 個 diagnostic token；它不
 改變正式 D2–D32 TPOT 的定義。`full-flat-h2d-reference-json` 是 matched
 denominator/reference，不是把 Full attention 放進 Twilight execution
 path。
 
-## 3. Flags and execution paths actually enabled
+## 3. Flags and execution paths actually enabled in the current candidate
 
 以下值以 runner command 及 `result.json` 為準；`false` 表示該 path 在
 目前 baseline 明確未開啟，而不是「尚未查到」。
@@ -100,12 +103,14 @@ path。
 | `fused_quest_score` | `true` | 使用 fused Quest page-score implementation。 |
 | `reuse_quant_metadata` | `true` | decode 間重用 packed INT4 quant metadata。 |
 | `layer_rope` | `true` (`--twilight-layer-rope`) | layer-level RoPE batching；這不是 full-layer QKV projection batching。 |
+| `gpu_compact_gqa_union` | `true` | Top-p membership不變；GPU直接形成8組exact GQA membership bitmap。 |
+| `gpu_union_validate_cpu` | `false` | 只在correctness run開啟；formal TPOT不可雙路重算CPU union。 |
 
 ### CPU union, gather, transfer and attention layout
 
 | option | effective value | 實際路徑 |
 |---|---|---|
-| `cpu_bitmap_union` | `true` | CPU NumPy bitmap membership + `flatnonzero` 做每個 GQA group 的 union。 |
+| `cpu_bitmap_union` | command仍為 `true`，formal新路徑不執行 | 保留舊baseline/fallback與validation；GPU-union formal path直接使用GPU產生的membership。 |
 | `cpu_flat_gather` | `true` | 建立 flat row indices；目前由 CPU `torch.index_select` 取 K/V。 |
 | `cpu_native_gather` | `false` | 不走 C++/OpenMP native gather。 |
 | `cpu_run_gather` | `false` | 不走 `CpuKVRunGather` run-copy path。 |
@@ -113,7 +118,7 @@ path。
 | `direct_attention_layout` | `true` | 直接寫入 GPU attention layout，保留 current-token row，避免每 layer 做完整 history+new-token GPU `cat`。 |
 | `early_gpu_metadata` | `true` | 在 CPU gather/H2D 前建立 `cu_seqlens` 等 GPU metadata。 |
 | `skip_unused_host_views` | `true` | flat gather path 不建立未使用的 host views。 |
-| `fused_final_indices` | `false` | final selected positions/counts 仍走目前既有 bundle 與一次 GPU→CPU transfer。 |
+| `fused_final_indices` | `false` | 新路徑不使用舊fused per-Q bundle；直接由rank prefix寫group membership。 |
 | `writeback_mode` | `delta` | 新 KV 以 delta-only D2H schedule 寫回；不是每 token 重新搬完整 cache。 |
 | `activation_wait_mode` | `event` | 以 event-based synchronization 等待 activation/cache readiness。 |
 | `cpu_threads` | `6` | result artifact 的 effective PyTorch CPU thread count。 |
@@ -124,7 +129,8 @@ path。
 `twilight_layer_projection=false`、`twilight_per_head_varlen_reference=false`、
 `quest_layer_flat_ragged=false`、`quest_per_head_varlen_reference=false`、
 `sparse_gather_stabilized=false`、`host_memory_trace=false`、
-`twilight_detailed_selection_profile=false`。`short_head_count=0` 也表示這
+`twilight_detailed_selection_profile=false`、
+`twilight_previous_token_resident_cache=false`。`short_head_count=0` 也表示這
 個 32K baseline 沒有另外保留 short-head Full path。
 
 ## 4. Actual data flow
@@ -134,10 +140,10 @@ path。
 
 1. 每一 layer 做 Q/K/V projection；`layer_rope=true` 時，RoPE 以 layer-level batch 方式處理 query/KV。
 2. `prepare_layer_selection` 先以 Quest page metadata 做第一輪 page score/Top-k，形成最多 8192 tokens 的 candidate pool。
-3. 第二輪以 packed INT4 K 的 quant metadata 做 candidate preparation；`triton_prepare` 融合 gather/unpack/dequant materialization，接著使用 FP32 QK、scale、argsort、Softmax、cumsum/searchsorted 取得 dynamic Top-p counts 與 selected positions。
-4. counts、desired counts 與 padded final positions 經一次 GPU→CPU transfer；這個 `.cpu()` 所含的是 queued GPU work 等待加 transfer，不宣稱是純 DMA 時間。
-5. CPU 對每個 Q 使用 `sink + selected + recent` positions，並以 `cpu_bitmap_union` 對同一 GQA KV group 做 union。
-6. `cpu_flat_gather` 建立 flat row indices；四個 pipeline chunks 各自以 CPU `torch.index_select` gather K/V，立即 enqueue nonblocking H2D。`cpu_native_gather` 與 `cpu_run_gather` 在這條 path 都是關閉的。
+3. 第二輪以 packed INT4 K 的 quant metadata 做 candidate preparation；`triton_prepare` 融合 gather/unpack/dequant materialization，接著使用 FP32 QK、scale、argsort、Softmax、cumsum/searchsorted 取得每個 Query head 的 dynamic Top-p `allocated` count。Quest、INT4 QK、Softmax與Top-p membership均未修改。
+4. GPU 以原 `order` gather active rank prefix，不做舊 per-Q positional sort；各 Query head 的 active positions scatter到同一 KV head 的 reusable boolean membership bitmap，並依當層 `old_length` 加入 Sink/Recent range。
+5. GPU→CPU 只搬8組boolean membership bitmap。CPU `numpy.flatnonzero` 將每組bitmap解碼為與舊CPU union elementwise相同的 sorted unique `group_positions`；formal path不再傳24個padded int64 rows，也不重算CPU union。
+6. `cpu_flat_gather` 直接使用上述8組positions建立flat row indices；四個 pipeline chunks 各自以 CPU `torch.index_select` gather K/V，立即 enqueue nonblocking H2D。`cpu_native_gather` 與 `cpu_run_gather` 在這條 path 都是關閉的；selected-KV bytes與舊control exact相同。
 7. `direct_attention_layout` 將 history rows 與 current-token slot 直接放進 GPU attention layout；`early_gpu_metadata` 提前準備 varlen metadata。
 8. `mp.py` 以 GQA group queries、`cu_seqlens` 與 FlashAttention varlen 執行 attention；layer output 再回到原本 decoder path。新 KV 的 delta-only D2H schedule 仍同時存在。
 
@@ -150,6 +156,7 @@ path。
 - `fused_final_indices=true`：fused final-index bundle 存在，但最新 command 沒有 `--twilight-fused-final-indices`。
 - `twilight_layer_projection=true`：full-layer QKV projection batching 存在，但 baseline 只有 `layer_rope=true`。
 - `qk_backend=triton`：direct INT4→QK backend 存在，但 baseline 使用 `triton_prepare`。
+- `previous_token_resident_cache=true`：previous-token selected-KV reuse prototype存在，但目前關閉。
 - `full_layer_flat`、`quest_layer_flat_ragged`、`twilight_layer_flat_ragged`、per-head varlen reference、`sparse_gather_stabilized`：均不在最新 coarse command。
 
 ### 已測試但沒有納入目前最佳 TPOT path
@@ -157,6 +164,8 @@ path。
 - Native gather：可執行的 pilot 沒有形成穩定 end-to-end TPOT 優勢，因此不取代目前 CPU `index_select`。
 - Run-gather / hybrid copy：已測試但沒有可重現的 TPOT 收益，因此維持 `cpu_run_gather=false`。
 - Fused final indices：device bundle 約有小幅 diagnostic 改善，但三題完整 TPOT 沒有改善，故維持 `fused_final_indices=false`。
+- Previous-token resident KV：selected-KV H2D bytes降低90.78%，但三題matched TPOT平均反而慢5.20%，故不採用。
+- 8:1 bit-packed GPU union handoff：index D2H降到約0.9 MiB/token，但CPU `unpackbits` decode升到約13.4–13.7 ms；三題throughput speedup只有8.70%，低於目前boolean bitmap的15.25%，故不採用。
 - `skip_unused_host_views`、early metadata、metadata reuse、4-chunk gather/H2D pipeline 與直接 attention layout 都是在各自 evidence 後組合進最新 full stack；不能把早期單一 pilot 的微小差異當成目前總體 TPOT 的單獨因果量。
 
 ### Correctness gate 未通過或不符合目前 exact path
@@ -166,12 +175,19 @@ path。
 
 ## 6. Evidence boundary
 
-這份文件的 140.691 ms/token 是三個 request 各一輪 coarse formal TPOT，
-不是多 trial steady-state confidence interval，也不是把所有 CPU/GPU
-diagnostic phase 相加後得到的數字。Selection timer、indices blocking、
+這份文件的 127.861 ms/token 是三個 request 各一組fresh matched formal
+TPOT的row-weighted mean；003另有一組repetition，但仍不是多 trial
+steady-state confidence interval，也不是把所有 CPU/GPU diagnostic phase
+相加後得到的數字。Selection timer、indices blocking、
 CPU union/gather、H2D 與 attention timer 彼此有 scope/clock overlap；它們
 只用來定位 control path 與瓶頸，不能直接相加成 TPOT。
 
-若之後要改 selection algorithm，應以本文件的 enabled path 作為固定
-baseline，另行保存 command、result、source hash 與 correctness/quality
-artifact；不要把本節列出的 experimental/failed path 默默混回 baseline。
+003 correctness gate對32 steps × 28 layers × 8 KV heads共7,168組union逐一
+elementwise相等；per-Q/group positions、D1/D2/D32 K/V＋valid lengths及
+P4/D1/D2/D32 logits hashes皆相同。`gpu_union_validate_cpu`只能用於這類
+diagnostic，不能混入formal TPOT。
+
+若之後要改 selection algorithm，應把這條GPU boolean-bitmap handoff固定為
+execution control，另行保存 command、result、source hash 與
+correctness/quality artifact；不要把本節列出的 experimental/failed path
+默默混回 baseline。
