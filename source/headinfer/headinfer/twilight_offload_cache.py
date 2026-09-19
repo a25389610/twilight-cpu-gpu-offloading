@@ -16,6 +16,7 @@ import math
 import time
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from .quest_offload_cache import QuestTopKOffloadedCache
@@ -157,6 +158,9 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         fused_quest_score: bool = False,
         skip_unused_host_views: bool = False,
         cpu_run_gather: bool = False,
+        previous_token_resident_cache: bool = False,
+        gpu_compact_gqa_union: bool = False,
+        gpu_union_validate_cpu: bool = False,
         **kwargs: Any,
     ) -> None:
         if candidate_token_budget <= 0:
@@ -185,6 +189,13 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         self.fused_quest_score = bool(fused_quest_score)
         self.skip_unused_host_views = bool(skip_unused_host_views)
         self.cpu_run_gather = bool(cpu_run_gather)
+        self.previous_token_resident_cache = bool(previous_token_resident_cache)
+        self.gpu_compact_gqa_union = bool(gpu_compact_gqa_union)
+        self.gpu_union_validate_cpu = bool(gpu_union_validate_cpu)
+        if self.gpu_compact_gqa_union and not gqa_groupwise_execution:
+            raise ValueError("GPU compact union requires GQA group execution")
+        if self.gpu_union_validate_cpu and not self.gpu_compact_gqa_union:
+            raise ValueError("GPU union CPU validation requires GPU compact union")
         if self.cpu_run_gather:
             if not (cpu_flat_gather and direct_attention_layout and gqa_groupwise_execution and gather_h2d_chunks > 0) or cpu_native_gather:
                 raise ValueError('run gather requires flat/direct/GQA chunk pipeline without native gather')
@@ -208,6 +219,18 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             self._cpu_kv_gather = CpuKVGather()
         if self.cpu_flat_gather and not gqa_groupwise_execution:
             raise ValueError("cpu_flat_gather requires GQA group execution")
+        if self.previous_token_resident_cache and not (
+            gqa_groupwise_execution
+            and cpu_flat_gather
+            and direct_attention_layout
+            and gather_h2d_chunks > 0
+            and not cpu_native_gather
+            and not cpu_run_gather
+        ):
+            raise ValueError(
+                "previous-token resident cache requires the current GQA "
+                "flat/direct/chunk path without native/run gather"
+            )
         layer_flat_ragged_execution = bool(
             kwargs.get("layer_flat_ragged_execution", False)
         )
@@ -259,9 +282,24 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         self._cached_twilight_positions: list[
             Optional[tuple[torch.Tensor, ...]]
         ] = [None] * self.geometry.num_entries
+        self._cached_twilight_group_positions: list[Optional[torch.Tensor]] = [
+            None
+        ] * self.geometry.num_entries
+        self._cached_twilight_per_q_lengths: list[
+            Optional[tuple[int, ...]]
+        ] = [None] * self.geometry.num_entries
+        self._gpu_group_membership: Optional[torch.Tensor] = None
         self._capture_budget_trace = False
         self._budget_trace: list[dict[str, Any]] = []
         self._group_union_trace: list[dict[str, Any]] = []
+        self._resident_positions: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._resident_keys: dict[int, torch.Tensor] = {}
+        self._resident_values: dict[int, torch.Tensor] = {}
+        self._resident_capacities: dict[int, int] = {}
+        self._resident_reuse_trace: list[dict[str, Any]] = []
+        self._capture_resident_attention_trace = False
+        self._resident_attention_trace_steps: set[int] = set()
+        self._resident_attention_trace: list[dict[str, Any]] = []
 
     def enable_selection_trace(self, enabled: bool = True) -> None:
         super().enable_selection_trace(enabled)
@@ -269,6 +307,40 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
 
     def group_union_trace(self) -> list[dict[str, Any]]:
         return list(self._group_union_trace)
+
+    def resident_reuse_trace(self) -> list[dict[str, Any]]:
+        """Return lightweight per-layer hit/miss rows for the opt-in prototype."""
+        return list(self._resident_reuse_trace)
+
+    def enable_resident_attention_trace(
+        self, enabled: bool = True, *, decode_steps: tuple[int, ...] = (1, 2, 32)
+    ) -> None:
+        """Capture exact SHA-256 checkpoints of assembled attention K/V.
+
+        This copies selected attention inputs to CPU and is diagnostic-only.
+        It must never be used for a TPOT claim.
+        """
+        self._capture_resident_attention_trace = bool(enabled)
+        self._resident_attention_trace_steps = {int(step) for step in decode_steps}
+        self._resident_attention_trace = []
+
+    def resident_attention_trace(self) -> list[dict[str, Any]]:
+        return list(self._resident_attention_trace)
+
+    def _ensure_resident_layer_capacity(self, layer: int, rows: int) -> None:
+        capacity = self._resident_capacities.get(layer, 0)
+        if capacity >= rows:
+            return
+        # D1 establishes the working set.  Small headroom avoids allocator work
+        # inside D2--D32 when Top-p union sizes drift by a few rows.
+        new_capacity = max(rows, math.ceil(rows * 1.05) + 64)
+        self._resident_keys[layer] = torch.empty(
+            (new_capacity, self.geometry.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._resident_values[layer] = torch.empty_like(self._resident_keys[layer])
+        self._resident_capacities[layer] = new_capacity
 
     def enable_budget_trace(self, enabled: bool = True) -> None:
         """Capture lightweight B1 counts for diagnostic-only runs."""
@@ -296,6 +368,24 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                     )
                 )
                 digest.update(selected_cpu.numpy().tobytes())
+        return digest.hexdigest()
+
+    def group_positions_sha256(self) -> str:
+        """Hash the latest exact sorted GQA unions."""
+        digest = hashlib.sha256()
+        for entry_index, positions in enumerate(
+            self._cached_twilight_group_positions
+        ):
+            if positions is None:
+                continue
+            selected_cpu = positions.detach().to(
+                device="cpu", dtype=torch.int64
+            ).contiguous()
+            digest.update(entry_index.to_bytes(4, byteorder="little", signed=False))
+            digest.update(
+                selected_cpu.numel().to_bytes(8, byteorder="little", signed=False)
+            )
+            digest.update(selected_cpu.numpy().tobytes())
         return digest.hexdigest()
 
     def _build_metadata(self, entry: int, key_states: torch.Tensor) -> None:
@@ -412,8 +502,20 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 torch.empty(0, dtype=torch.long)
                 for _ in range(self.num_query_heads_per_kv)
             )
+            protected = torch.cat(
+                (
+                    torch.arange(sink_end, dtype=torch.long),
+                    torch.arange(recent_start, old_length, dtype=torch.long),
+                )
+            )
             for entry in entries:
                 self._cached_twilight_positions[entry] = empty
+                if self.gpu_compact_gqa_union:
+                    self._cached_twilight_group_positions[entry] = protected.clone()
+                    self._cached_twilight_per_q_lengths[entry] = tuple(
+                        int(protected.numel())
+                        for _ in range(self.num_query_heads_per_kv)
+                    )
                 self._layer_prepared_entries.add(entry)
             return
 
@@ -604,34 +706,120 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             if self.budget_mode == "dynamic"
             else target_total - (query_heads - 1)
         )
-        if self.fused_final_indices:
-            from .twilight_fused_indices import fused_gather_mask
-            masked_positions = fused_gather_mask(candidate_positions, order, allocated, max_allocated, old_length)
-            sorted_selected = masked_positions.sort(dim=-1).values
-        else:
-            ranked_positions = torch.gather(candidate_positions, -1, order)
-            ranked_prefix = ranked_positions[..., :max_allocated]
-            active = torch.arange(max_allocated, device=self.device).view(1, 1, -1)
-            active = active < allocated.unsqueeze(-1)
+        allocated_cpu: Optional[torch.Tensor] = None
+        desired_cpu: Optional[torch.Tensor] = None
+        rows: Optional[torch.Tensor] = None
+        group_positions: Optional[list[torch.Tensor]] = None
+        transferred_bytes = 0
+        if self.gpu_compact_gqa_union:
+            # The consumer needs one sorted union per KV head, not four sorted
+            # per-Query-head rows.  Scatter the exact active prefixes into a
+            # reusable GPU membership map.  The compact bool map preserves set
+            # semantics; CPU flatnonzero reconstructs the exact sorted int64
+            # positions required by the unchanged gather path.
+            ranked_prefix = torch.gather(
+                candidate_positions,
+                -1,
+                order[..., :max_allocated],
+            )
+            active = torch.arange(
+                max_allocated, device=self.device
+            ).view(1, 1, -1) < allocated.unsqueeze(-1)
             sentinel = torch.full_like(ranked_prefix, old_length)
-            sorted_selected = torch.where(active, ranked_prefix, sentinel).sort(dim=-1).values
-        # Counts, Top-p desired counts, and all ragged selected positions share
-        # one GPU-to-CPU synchronization for the entire layer.
-        transfer = torch.cat(
-            (allocated.unsqueeze(-1), desired.unsqueeze(-1), sorted_selected),
-            dim=-1,
-        ).reshape(groups * query_heads, -1)
-        self._record_phase_end("twilight_final_b1_indices", subphase)
-        self._record_phase_end(
-            "twilight_selection_before_d2h", selection_cuda_phase
-        )
-        sync_started = time.perf_counter() if self.metrics_enabled else None
-        transfer_cpu = transfer.cpu()
-        sync_finished = time.perf_counter() if self.metrics_enabled else None
+            scatter_positions = torch.where(active, ranked_prefix, sentinel)
+            required_shape = (groups, self.geometry.max_cache_len + 1)
+            if (
+                self._gpu_group_membership is None
+                or tuple(self._gpu_group_membership.shape) != required_shape
+            ):
+                self._gpu_group_membership = torch.empty(
+                    required_shape, dtype=torch.bool, device=self.device
+                )
+            membership = self._gpu_group_membership[:, : old_length + 1]
+            membership.zero_()
+            membership.scatter_(1, scatter_positions.flatten(1), True)
+            membership[:, :sink_end] = True
+            membership[:, recent_start:old_length] = True
+            self._record_phase_end("twilight_gpu_gqa_union", subphase)
+            self._record_phase_end(
+                "twilight_selection_before_d2h", selection_cuda_phase
+            )
+            sync_started = time.perf_counter() if self.metrics_enabled else None
+            membership_cpu = membership[:, :old_length].cpu()
+            sync_finished = time.perf_counter() if self.metrics_enabled else None
+            transferred_bytes += membership_cpu.numel() * membership_cpu.element_size()
+            decode_started = time.perf_counter() if self.metrics_enabled else None
+            group_positions = [
+                torch.from_numpy(np.flatnonzero(row.numpy()))
+                for row in membership_cpu
+            ]
+            if self.metrics_enabled:
+                assert decode_started is not None
+                self.metrics["twilight_compact_index_decode_wall_seconds"] += (
+                    time.perf_counter() - decode_started
+                )
 
-        allocated_cpu = transfer_cpu[:, 0].view(groups, query_heads)
-        desired_cpu = transfer_cpu[:, 1].view(groups, query_heads)
-        rows = transfer_cpu[:, 2:]
+            need_counts = (
+                self.metrics_enabled
+                or self._capture_budget_trace
+                or self._capture_selection_trace
+                or self.gpu_union_validate_cpu
+            )
+            if need_counts:
+                count_transfer = torch.stack((allocated, desired), dim=-1).cpu()
+                allocated_cpu = count_transfer[..., 0]
+                desired_cpu = count_transfer[..., 1]
+                transferred_bytes += (
+                    count_transfer.numel() * count_transfer.element_size()
+                )
+
+            need_per_q_rows = (
+                self._capture_budget_trace
+                or self._capture_selection_trace
+                or self.gpu_union_validate_cpu
+            )
+            if need_per_q_rows:
+                rows = ranked_prefix.reshape(groups * query_heads, -1).cpu()
+                transferred_bytes += rows.numel() * rows.element_size()
+        else:
+            if self.fused_final_indices:
+                from .twilight_fused_indices import fused_gather_mask
+                masked_positions = fused_gather_mask(
+                    candidate_positions,
+                    order,
+                    allocated,
+                    max_allocated,
+                    old_length,
+                )
+                sorted_selected = masked_positions.sort(dim=-1).values
+            else:
+                ranked_positions = torch.gather(candidate_positions, -1, order)
+                ranked_prefix = ranked_positions[..., :max_allocated]
+                active = torch.arange(
+                    max_allocated, device=self.device
+                ).view(1, 1, -1) < allocated.unsqueeze(-1)
+                sentinel = torch.full_like(ranked_prefix, old_length)
+                sorted_selected = torch.where(
+                    active, ranked_prefix, sentinel
+                ).sort(dim=-1).values
+            # Counts, Top-p desired counts, and all ragged selected positions
+            # share one GPU-to-CPU synchronization for the entire layer.
+            transfer = torch.cat(
+                (allocated.unsqueeze(-1), desired.unsqueeze(-1), sorted_selected),
+                dim=-1,
+            ).reshape(groups * query_heads, -1)
+            self._record_phase_end("twilight_final_b1_indices", subphase)
+            self._record_phase_end(
+                "twilight_selection_before_d2h", selection_cuda_phase
+            )
+            sync_started = time.perf_counter() if self.metrics_enabled else None
+            transfer_cpu = transfer.cpu()
+            sync_finished = time.perf_counter() if self.metrics_enabled else None
+            transferred_bytes += transfer_cpu.numel() * transfer_cpu.element_size()
+            allocated_cpu = transfer_cpu[:, 0].view(groups, query_heads)
+            desired_cpu = transfer_cpu[:, 1].view(groups, query_heads)
+            rows = transfer_cpu[:, 2:]
+
         decode_step = (
             old_length - self._prompt_length + 1
             if self._prompt_length is not None
@@ -641,38 +829,76 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         for group_index, entry in enumerate(entries):
             start = group_index * query_heads
             selected: list[torch.Tensor] = []
-            for head_index in range(query_heads):
-                count = int(allocated_cpu[group_index, head_index])
-                selected_row = rows[start + head_index, :count]
-                selected.append(selected_row)
-                if self._capture_budget_trace:
-                    source_pages = torch.div(
-                        selected_row - self.sink_tokens,
-                        self.block_size,
-                        rounding_mode="floor",
+            if rows is not None:
+                assert allocated_cpu is not None
+                for head_index in range(query_heads):
+                    count = int(allocated_cpu[group_index, head_index])
+                    selected_row = rows[start + head_index, :count]
+                    if self.gpu_compact_gqa_union:
+                        # Diagnostic GPU-union traces transfer rank order and
+                        # normalize it on CPU.  Baseline rows were already
+                        # sorted on GPU and must not be sorted a second time.
+                        selected_row = selected_row.sort().values
+                    selected.append(selected_row)
+                    if self._capture_budget_trace:
+                        assert desired_cpu is not None
+                        source_pages = torch.div(
+                            selected_row - self.sink_tokens,
+                            self.block_size,
+                            rounding_mode="floor",
+                        )
+                        self._budget_trace.append(
+                            {
+                                "decode_step": decode_step,
+                                "entry": entry,
+                                "layer": entries[0] // groups,
+                                "kv_head": group_index,
+                                "query_head_in_group": head_index,
+                                "query_head": group_index * query_heads + head_index,
+                                "budget_mode": self.budget_mode,
+                                "b0_tokens": int(order.shape[-1]),
+                                "raw_b1_tokens": int(desired_cpu[group_index, head_index]),
+                                "selected_adaptive_tokens": count,
+                                "protected_tokens": protected_tokens,
+                                "selected_history_tokens": protected_tokens + count,
+                                "eligible_history_tokens": eligible_tokens,
+                                "full_history_tokens": old_length,
+                                "unique_source_pages": int(
+                                    torch.unique(source_pages).numel()
+                                ),
+                            }
+                        )
+            if selected:
+                self._cached_twilight_positions[entry] = tuple(selected)
+            elif self.gpu_compact_gqa_union:
+                self._cached_twilight_positions[entry] = None
+            if group_positions is not None:
+                union = group_positions[group_index]
+                self._cached_twilight_group_positions[entry] = union
+                if allocated_cpu is not None:
+                    self._cached_twilight_per_q_lengths[entry] = tuple(
+                        protected_tokens + int(value)
+                        for value in allocated_cpu[group_index]
                     )
-                    self._budget_trace.append(
-                        {
-                            "decode_step": decode_step,
-                            "entry": entry,
-                            "layer": entries[0] // groups,
-                            "kv_head": group_index,
-                            "query_head_in_group": head_index,
-                            "query_head": group_index * query_heads + head_index,
-                            "budget_mode": self.budget_mode,
-                            "b0_tokens": int(order.shape[-1]),
-                            "raw_b1_tokens": int(desired_cpu[group_index, head_index]),
-                            "selected_adaptive_tokens": count,
-                            "protected_tokens": protected_tokens,
-                            "selected_history_tokens": protected_tokens + count,
-                            "eligible_history_tokens": eligible_tokens,
-                            "full_history_tokens": old_length,
-                            "unique_source_pages": int(
-                                torch.unique(source_pages).numel()
-                            ),
-                        }
+                else:
+                    self._cached_twilight_per_q_lengths[entry] = None
+                if self.gpu_union_validate_cpu:
+                    sink_cpu = torch.arange(sink_end, dtype=torch.long)
+                    recent_cpu = torch.arange(
+                        recent_start, old_length, dtype=torch.long
                     )
-            self._cached_twilight_positions[entry] = tuple(selected)
+                    cpu_positions = [
+                        torch.cat((sink_cpu, row, recent_cpu)) for row in selected
+                    ]
+                    expected = (
+                        self._cpu_token_union(cpu_positions, old_length)
+                        if self.cpu_bitmap_union
+                        else torch.unique(torch.cat(cpu_positions), sorted=True)
+                    )
+                    if not torch.equal(union, expected):
+                        raise AssertionError(
+                            f"GPU compact GQA union mismatch for entry {entry}"
+                        )
             self._layer_prepared_entries.add(entry)
 
         if self.metrics_enabled:
@@ -681,9 +907,11 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             self.metrics["twilight_index_sync_and_position_wall_seconds"] += (
                 sync_finished - sync_started
             )
+            self.metrics["twilight_index_d2h_bytes"] += transferred_bytes
             self.metrics["twilight_selector_wall_seconds"] += (
                 sync_finished - selector_wall_started
             )
+            assert allocated_cpu is not None and desired_cpu is not None
             self.metrics["twilight_raw_top_p_tokens_total"] += int(desired_cpu.sum())
             self.metrics["twilight_allocated_tokens_total"] += int(allocated_cpu.sum())
             self.metrics["twilight_allocated_tokens_min_sum"] += int(
@@ -980,21 +1208,53 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 time.perf_counter() - phase_started
             )
 
-        # Reproduce the unmodified per-Query-head selected sets first.  The
-        # union below is the only selection-semantic transformation.
         layer_positions: list[list[torch.Tensor]] = []
-        for entry, query in zip(entries, queries):
-            positions = self._selected_positions(
-                query=query, entry=entry, old_length=old_length
-            )
-            layer_positions.append(positions)
-
         union_started = time.perf_counter() if self.metrics_enabled else None
-        group_positions = [
-            self._cpu_token_union(positions, old_length) if self.cpu_bitmap_union
-            else torch.unique(torch.cat(positions), sorted=True)
-            for positions in layer_positions
-        ]
+        if self.gpu_compact_gqa_union:
+            group_positions = []
+            per_q_lengths_parts: list[int] = []
+            for entry, query in zip(entries, queries):
+                union = self._cached_twilight_group_positions[entry]
+                if union is None:
+                    raise AssertionError("prepared GPU GQA union is missing")
+                group_positions.append(union)
+                cached_lengths = self._cached_twilight_per_q_lengths[entry]
+                if cached_lengths is not None:
+                    per_q_lengths_parts.extend(cached_lengths)
+                if self._capture_selection_trace:
+                    # Diagnostic-only: prepare_layer_selection retained exact
+                    # per-Q rows so the existing trace format remains usable.
+                    layer_positions.append(
+                        self._selected_positions(
+                            query=query, entry=entry, old_length=old_length
+                        )
+                    )
+                else:
+                    self._layer_prepared_entries.discard(entry)
+            per_q_lengths = tuple(per_q_lengths_parts)
+            if self.metrics_enabled:
+                self.metrics["twilight_gpu_group_union_handoff_calls"] += 1
+        else:
+            # Reproduce the unmodified per-Query-head selected sets first.  The
+            # CPU union below is the baseline selection-semantic transformation.
+            for entry, query in zip(entries, queries):
+                positions = self._selected_positions(
+                    query=query, entry=entry, old_length=old_length
+                )
+                layer_positions.append(positions)
+            group_positions = [
+                self._cpu_token_union(positions, old_length)
+                if self.cpu_bitmap_union
+                else torch.unique(torch.cat(positions), sorted=True)
+                for positions in layer_positions
+            ]
+            per_q_lengths = tuple(
+                int(selected.numel())
+                for positions in layer_positions
+                for selected in positions
+            )
+            for entry, union in zip(entries, group_positions):
+                self._cached_twilight_group_positions[entry] = union
         if self._capture_selection_trace:
             decode_step = (
                 old_length - self._prompt_length + 1
@@ -1023,11 +1283,6 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             )
             self.metrics["twilight_group_union_prepare_calls"] += 1
 
-        per_q_lengths = tuple(
-            int(selected.numel())
-            for positions in layer_positions
-            for selected in positions
-        )
         group_history_lengths = tuple(
             int(selected.numel()) for selected in group_positions
         )
@@ -1035,8 +1290,77 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         per_q_history_total = sum(per_q_lengths)
         total_history = sum(group_history_lengths)
         total_attention = sum(group_total_lengths)
-        if total_history > per_q_history_total:
+        if per_q_lengths and total_history > per_q_history_total:
             raise AssertionError("GQA union cannot exceed per-Query-head payload")
+
+        layer_index = entries[0] // group_count
+        if entries != list(
+            range(layer_index * group_count, (layer_index + 1) * group_count)
+        ):
+            raise AssertionError("GQA entries must be one contiguous decoder layer")
+        decode_step = (
+            old_length - self._prompt_length + 1
+            if self._prompt_length is not None
+            else -1
+        )
+        previous_positions = self._resident_positions.get(layer_index)
+        reuse_active = bool(
+            self.previous_token_resident_cache
+            and previous_positions is not None
+            and layer_index in self._resident_keys
+        )
+        hit_source_parts: list[torch.Tensor] = []
+        hit_destination_parts: list[torch.Tensor] = []
+        miss_row_parts: list[torch.Tensor] = []
+        miss_destination_parts: list[torch.Tensor] = []
+        history_destination_parts: list[torch.Tensor] = []
+        previous_offset = 0
+        attention_offset = 0
+        if reuse_active:
+            assert previous_positions is not None
+            if len(previous_positions) != group_count:
+                raise AssertionError("resident GQA group count changed")
+            for entry, current, previous in zip(
+                entries, group_positions, previous_positions
+            ):
+                matches = torch.searchsorted(previous, current)
+                valid = matches.lt(previous.numel())
+                safe_matches = matches.clamp_max(max(0, previous.numel() - 1))
+                hits = valid & previous.index_select(0, safe_matches).eq(current)
+                current_rows = torch.arange(current.numel(), dtype=torch.long)
+                hit_rows = current_rows[hits]
+                missed_rows = current_rows[~hits]
+                hit_source_parts.append(previous_offset + matches[hits])
+                hit_destination_parts.append(attention_offset + hit_rows)
+                miss_row_parts.append(
+                    entry * self.geometry.max_cache_len + current[~hits]
+                )
+                miss_destination_parts.append(attention_offset + missed_rows)
+                history_destination_parts.append(attention_offset + current_rows)
+                previous_offset += previous.numel()
+                attention_offset += current.numel() + 1
+        empty_indices = torch.empty(0, dtype=torch.long)
+        hit_sources = (
+            torch.cat(hit_source_parts) if hit_source_parts else empty_indices
+        )
+        hit_destinations = (
+            torch.cat(hit_destination_parts)
+            if hit_destination_parts
+            else empty_indices
+        )
+        miss_rows = torch.cat(miss_row_parts) if miss_row_parts else empty_indices
+        miss_destinations = (
+            torch.cat(miss_destination_parts)
+            if miss_destination_parts
+            else empty_indices
+        )
+        history_destinations = (
+            torch.cat(history_destination_parts)
+            if history_destination_parts
+            else empty_indices
+        )
+        if reuse_active and hit_sources.numel() + miss_rows.numel() != total_history:
+            raise AssertionError("resident hit/miss partition is incomplete")
 
         def build_cu_seqlens():
             started = time.perf_counter() if self.metrics_enabled else None
@@ -1065,13 +1389,19 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         host_flat_key = self._host_layer_flat_keys[slot]
         host_flat_value = self._host_layer_flat_values[slot]
         history_offset = 0
-        transfer_rows = total_attention if self.direct_attention_layout else total_history
+        transfer_rows = (
+            int(miss_rows.numel())
+            if reuse_active
+            else total_attention if self.direct_attention_layout else total_history
+        )
         if transfer_rows > host_flat_key.shape[0]:
             raise ValueError('insufficient host pack capacity for direct attention layout')
         new_token_offsets = []
         pipeline_enqueue_seconds = 0.0
         pipeline_chunks = 0
         for entry, selected in zip(entries, group_positions):
+            if reuse_active:
+                continue
             if not (self.skip_unused_host_views and self.cpu_flat_gather):
                 host_key = self._host_tensor("key", entry)[0, 0, :old_length]
                 host_value = self._host_tensor("value", entry)[0, 0, :old_length]
@@ -1093,6 +1423,9 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 new_token_offsets.append(stop)
                 stop += 1
             history_offset = stop
+        if reuse_active:
+            self._host_layer_flat_row_indices[slot][:transfer_rows].copy_(miss_rows)
+            history_offset = transfer_rows
         if self.cpu_flat_gather:
             rows = self._host_layer_flat_row_indices[slot][:transfer_rows]
             if self.gather_h2d_chunks:
@@ -1112,8 +1445,22 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                         torch.index_select(self._host_value_rows, 0, rows[chunk_start:chunk_stop],
                                            out=host_flat_value[chunk_start:chunk_stop])
                     def copy_chunk(start=chunk_start, stop=chunk_stop):
-                        self._gpu_layer_flat_attention_keys[start:stop, 0].copy_(host_flat_key[start:stop], non_blocking=True)
-                        self._gpu_layer_flat_attention_values[start:stop, 0].copy_(host_flat_value[start:stop], non_blocking=True)
+                        target_key = (
+                            self._gpu_layer_flat_history_keys
+                            if reuse_active
+                            else self._gpu_layer_flat_attention_keys[:, 0]
+                        )
+                        target_value = (
+                            self._gpu_layer_flat_history_values
+                            if reuse_active
+                            else self._gpu_layer_flat_attention_values[:, 0]
+                        )
+                        target_key[start:stop].copy_(
+                            host_flat_key[start:stop], non_blocking=True
+                        )
+                        target_value[start:stop].copy_(
+                            host_flat_value[start:stop], non_blocking=True
+                        )
                     enqueue_started = time.perf_counter() if self.metrics_enabled else None
                     self._record_copy('h2d', copy_chunk,
                         2 * (chunk_stop-chunk_start) * self.geometry.head_dim * key_states[0].element_size(), copy_calls=2)
@@ -1174,6 +1521,84 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
 
         assert self._gpu_layer_flat_attention_keys is not None
         assert self._gpu_layer_flat_attention_values is not None
+        gpu_indices: dict[str, torch.Tensor] = {}
+        if reuse_active:
+            index_bytes = (
+                hit_sources.numel()
+                + hit_destinations.numel()
+                + miss_destinations.numel()
+                + history_destinations.numel()
+            ) * hit_sources.element_size()
+
+            def copy_resident_indices() -> None:
+                gpu_indices["hit_sources"] = hit_sources.to(self.device)
+                gpu_indices["hit_destinations"] = hit_destinations.to(self.device)
+                gpu_indices["miss_destinations"] = miss_destinations.to(self.device)
+                gpu_indices["history_destinations"] = history_destinations.to(
+                    self.device
+                )
+
+            self._record_copy(
+                "resident_index_h2d",
+                copy_resident_indices,
+                index_bytes,
+                copy_calls=4,
+            )
+            previous_key = self._resident_keys[layer_index]
+            previous_value = self._resident_values[layer_index]
+            hit_count = int(hit_sources.numel())
+            miss_count = int(miss_rows.numel())
+
+            def assemble_resident_hits() -> None:
+                if hit_count:
+                    self._gpu_layer_flat_attention_keys[:, 0].index_copy_(
+                        0,
+                        gpu_indices["hit_destinations"],
+                        previous_key.index_select(0, gpu_indices["hit_sources"]),
+                    )
+                    self._gpu_layer_flat_attention_values[:, 0].index_copy_(
+                        0,
+                        gpu_indices["hit_destinations"],
+                        previous_value.index_select(0, gpu_indices["hit_sources"]),
+                    )
+
+            self._record_copy(
+                "resident_hit_copy",
+                assemble_resident_hits,
+                2
+                * hit_count
+                * self.geometry.head_dim
+                * key_states[0].element_size(),
+                copy_calls=2 if hit_count else 0,
+            )
+
+            def assemble_resident_misses() -> None:
+                if miss_count:
+                    self._gpu_layer_flat_attention_keys[:, 0].index_copy_(
+                        0,
+                        gpu_indices["miss_destinations"],
+                        self._gpu_layer_flat_history_keys[:miss_count],
+                    )
+                    self._gpu_layer_flat_attention_values[:, 0].index_copy_(
+                        0,
+                        gpu_indices["miss_destinations"],
+                        self._gpu_layer_flat_history_values[:miss_count],
+                    )
+
+            self._record_copy(
+                "resident_miss_scatter",
+                assemble_resident_misses,
+                2
+                * miss_count
+                * self.geometry.head_dim
+                * key_states[0].element_size(),
+                copy_calls=2 if miss_count else 0,
+            )
+            attention_offset = 0
+            new_token_offsets = []
+            for history_length in group_history_lengths:
+                new_token_offsets.append(attention_offset + history_length)
+                attention_offset += history_length + 1
         key_segments: list[torch.Tensor] = []
         value_segments: list[torch.Tensor] = []
         history_offset = 0
@@ -1203,8 +1628,111 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 dim=0,
                 out=self._gpu_layer_flat_attention_values[:total_attention, 0],
             )
+
+        if self.previous_token_resident_cache:
+            self._ensure_resident_layer_capacity(layer_index, total_history)
+            resident_key = self._resident_keys[layer_index]
+            resident_value = self._resident_values[layer_index]
+            if reuse_active:
+                gpu_history_destinations = gpu_indices["history_destinations"]
+            else:
+                destinations = []
+                attention_offset = 0
+                for history_length in group_history_lengths:
+                    destinations.append(
+                        attention_offset
+                        + torch.arange(history_length, dtype=torch.long)
+                    )
+                    attention_offset += history_length + 1
+                host_history_destinations = torch.cat(destinations)
+                gpu_history_destinations = host_history_destinations.to(self.device)
+
+            def snapshot_current_union() -> None:
+                torch.index_select(
+                    self._gpu_layer_flat_attention_keys[:, 0],
+                    0,
+                    gpu_history_destinations,
+                    out=resident_key[:total_history],
+                )
+                torch.index_select(
+                    self._gpu_layer_flat_attention_values[:, 0],
+                    0,
+                    gpu_history_destinations,
+                    out=resident_value[:total_history],
+                )
+
+            self._record_copy(
+                "resident_snapshot_copy",
+                snapshot_current_union,
+                2
+                * total_history
+                * self.geometry.head_dim
+                * key_states[0].element_size(),
+                copy_calls=2,
+            )
+            self._resident_positions[layer_index] = tuple(
+                selected.clone() for selected in group_positions
+            )
+            resident_hit_rows = int(hit_sources.numel()) if reuse_active else 0
+            resident_miss_rows = (
+                int(miss_rows.numel()) if reuse_active else total_history
+            )
+            self._resident_reuse_trace.append(
+                {
+                    "decode_step": decode_step,
+                    "layer": layer_index,
+                    "history_rows": total_history,
+                    "hit_rows": resident_hit_rows,
+                    "miss_rows": resident_miss_rows,
+                    "hit_ratio": (
+                        resident_hit_rows / total_history if total_history else 0.0
+                    ),
+                    "selected_kv_h2d_bytes": (
+                        2
+                        * resident_miss_rows
+                        * self.geometry.head_dim
+                        * key_states[0].element_size()
+                    ),
+                    "resident_logical_bytes": (
+                        2
+                        * total_history
+                        * self.geometry.head_dim
+                        * key_states[0].element_size()
+                    ),
+                }
+            )
         if cu_seqlens is None:
             cu_seqlens = build_cu_seqlens()
+
+        if (
+            self._capture_resident_attention_trace
+            and decode_step in self._resident_attention_trace_steps
+        ):
+            key_cpu = (
+                self._gpu_layer_flat_attention_keys[:total_attention]
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            value_cpu = (
+                self._gpu_layer_flat_attention_values[:total_attention]
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            self._resident_attention_trace.append(
+                {
+                    "decode_step": decode_step,
+                    "layer": layer_index,
+                    "valid_lengths": group_total_lengths,
+                    "key_sha256": hashlib.sha256(
+                        key_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                    "value_sha256": hashlib.sha256(
+                        value_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                }
+            )
 
         for entry, new_length, key, value, total_length in zip(
             entries, new_lengths, key_states, value_states, group_total_lengths
@@ -1305,6 +1833,29 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 "fused_quest_score": self.fused_quest_score,
                 "skip_unused_host_views": self.skip_unused_host_views,
                 "cpu_run_gather": self.cpu_run_gather,
+                "previous_token_resident_cache": (
+                    self.previous_token_resident_cache
+                ),
+                "gpu_compact_gqa_union": self.gpu_compact_gqa_union,
+                "gpu_union_validate_cpu": self.gpu_union_validate_cpu,
+                "gpu_group_membership_allocated_bytes": (
+                    0
+                    if self._gpu_group_membership is None
+                    else self._gpu_group_membership.numel()
+                    * self._gpu_group_membership.element_size()
+                ),
+                "resident_cache_logical_bytes": sum(
+                    2
+                    * sum(position.numel() for position in positions)
+                    * self.geometry.head_dim
+                    * torch.tensor([], dtype=self.dtype).element_size()
+                    for positions in self._resident_positions.values()
+                ),
+                "resident_cache_allocated_bytes": sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensors in (self._resident_keys, self._resident_values)
+                    for tensor in tensors.values()
+                ),
                 "skip_first_two_dense_layers": False,
                 "layer_batched_selection": self.layer_batched_selection,
                 "layer_batched_twilight_selection": self.layer_batched_selection,
