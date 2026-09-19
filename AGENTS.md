@@ -69,3 +69,31 @@ Write weekly progress reports in Traditional Chinese. Keep model names, API
 names, code identifiers, units, and technical terms such as `Pinned Slab`,
 `CUDA stream`, `torch.cat`, `Prefill`, and `Decode` in English when that is
 clearer than translation.
+
+
+## GitHub weekly experiment-report mirror
+
+This repository is the readable GitHub mirror for standalone Twilight/HeadInfer
+experiment reports. The local `reports/weekly/YYYY-MM-DD.md` remains canonical;
+this mirror does not replace it.
+
+After a verified material experiment creates or updates a standalone Markdown
+report, sync a GitHub-readable copy to:
+
+```text
+reports/<MMDD>/
+```
+
+`<MMDD>` is the Wednesday immediately after the local reporting week closes.
+For example, local week 2026-09-16 through 2026-09-22 maps to `reports/0923/`.
+On each new Wednesday, create or confirm the new folder before adding that
+week's experiment reports.
+
+Only publish self-contained Markdown: state experimental conditions,
+quantitative observations, limitations, and relevant local artifact/source
+references. Diagnostic and single-run evidence must retain its scope and
+preliminary limitations. Do not mirror raw JSON/CSV/logs/checkpoints/logits,
+timelines, large traces, or sensitive data. Avoid duplicate byte-identical
+uploads; revise the existing Markdown when evidence changes. An explicit user
+request not to publish, to delay publication, or to use another repository
+overrides this rule.
