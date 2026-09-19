@@ -161,6 +161,8 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         previous_token_resident_cache: bool = False,
         gpu_compact_gqa_union: bool = False,
         gpu_union_validate_cpu: bool = False,
+        batched_new_kv_d2h: bool = False,
+        new_kv_d2h_granularity: str = "token",
         **kwargs: Any,
     ) -> None:
         if candidate_token_budget <= 0:
@@ -192,6 +194,10 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         self.previous_token_resident_cache = bool(previous_token_resident_cache)
         self.gpu_compact_gqa_union = bool(gpu_compact_gqa_union)
         self.gpu_union_validate_cpu = bool(gpu_union_validate_cpu)
+        self.batched_new_kv_d2h = bool(batched_new_kv_d2h)
+        if new_kv_d2h_granularity not in {"layer", "token"}:
+            raise ValueError("new KV D2H granularity must be 'layer' or 'token'")
+        self.new_kv_d2h_granularity = new_kv_d2h_granularity
         if self.gpu_compact_gqa_union and not gqa_groupwise_execution:
             raise ValueError("GPU compact union requires GQA group execution")
         if self.gpu_union_validate_cpu and not self.gpu_compact_gqa_union:
@@ -300,6 +306,282 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         self._capture_resident_attention_trace = False
         self._resident_attention_trace_steps: set[int] = set()
         self._resident_attention_trace: list[dict[str, Any]] = []
+        self._capture_new_kv_trace = False
+        self._new_kv_trace: list[dict[str, Any]] = []
+        self._new_kv_trace_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+        self._new_kv_trace_pending_read: dict[
+            int, tuple[int, int, str, str]
+        ] = {}
+        self._new_kv_control_pending: dict[int, tuple[int, int]] = {}
+        self._batched_new_kv_pending: dict[
+            int, tuple[torch.cuda.Event, int, int, tuple[int, ...]]
+        ] = {}
+        if self.batched_new_kv_d2h:
+            staging_shape = (
+                self.geometry.num_entries,
+                self.geometry.head_dim,
+            )
+            self._new_kv_gpu_keys = torch.empty(
+                staging_shape, dtype=self.dtype, device=self.device
+            )
+            self._new_kv_gpu_values = torch.empty(
+                staging_shape, dtype=self.dtype, device=self.device
+            )
+            self._new_kv_host_keys = torch.empty(
+                staging_shape, dtype=self.dtype, device="cpu", pin_memory=True
+            )
+            self._new_kv_host_values = torch.empty(
+                staging_shape, dtype=self.dtype, device="cpu", pin_memory=True
+            )
+        else:
+            self._new_kv_gpu_keys = None
+            self._new_kv_gpu_values = None
+            self._new_kv_host_keys = None
+            self._new_kv_host_values = None
+
+    def enable_new_kv_trace(self, enabled: bool = True) -> None:
+        """Capture exact host-slab new-K/V hashes; diagnostic-only."""
+        self._capture_new_kv_trace = bool(enabled)
+        self._new_kv_trace = []
+        self._new_kv_trace_by_key = {}
+        self._new_kv_trace_pending_read = {}
+
+    def new_kv_trace(self) -> list[dict[str, Any]]:
+        return list(self._new_kv_trace)
+
+    @staticmethod
+    def _tensor_sha256(tensor: torch.Tensor) -> str:
+        value = tensor.detach().to(device="cpu").contiguous()
+        return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+    def _capture_new_kv_host_rows(
+        self,
+        entries: tuple[int, ...],
+        *,
+        decode_step: int,
+        position: int,
+    ) -> None:
+        if not self._capture_new_kv_trace:
+            return
+        for entry in entries:
+            key_row = self._host_tensor("key", entry)[0, 0, position]
+            value_row = self._host_tensor("value", entry)[0, 0, position]
+            key_hash = self._tensor_sha256(key_row)
+            value_hash = self._tensor_sha256(value_row)
+            record = {
+                "decode_step": decode_step,
+                "layer": entry // 8,
+                "kv_head": entry % 8,
+                "entry": entry,
+                "position": position,
+                "key_sha256": key_hash,
+                "value_sha256": value_hash,
+                "verified_before_next_read": False,
+                "consumer_decode_step": None,
+            }
+            self._new_kv_trace.append(record)
+            self._new_kv_trace_by_key[(decode_step, entry)] = record
+            self._new_kv_trace_pending_read[entry] = (
+                decode_step,
+                position,
+                key_hash,
+                value_hash,
+            )
+
+    def _verify_new_kv_before_read(self, entries: list[int], decode_step: int) -> None:
+        if not self._capture_new_kv_trace:
+            return
+        for entry in entries:
+            pending = self._new_kv_trace_pending_read.pop(entry, None)
+            if pending is None:
+                continue
+            prior_step, position, expected_key, expected_value = pending
+            actual_key = self._tensor_sha256(
+                self._host_tensor("key", entry)[0, 0, position]
+            )
+            actual_value = self._tensor_sha256(
+                self._host_tensor("value", entry)[0, 0, position]
+            )
+            if actual_key != expected_key or actual_value != expected_value:
+                raise AssertionError("new KV host row changed before next-token read")
+            record = self._new_kv_trace_by_key[(prior_step, entry)]
+            record["verified_before_next_read"] = True
+            record["consumer_decode_step"] = decode_step
+
+    def _scatter_batched_new_kv_to_host(
+        self,
+        *,
+        start_entry: int,
+        entries: tuple[int, ...],
+        position: int,
+    ) -> None:
+        if self._new_kv_host_keys is None or self._new_kv_host_values is None:
+            raise AssertionError("new KV staging buffers are missing")
+        count = len(entries)
+        if entries != tuple(range(start_entry, start_entry + count)):
+            raise AssertionError("batched new KV entries must be contiguous")
+        element_stride = self.geometry.max_cache_len * self.geometry.head_dim
+        key_offset = start_entry * element_stride + position * self.geometry.head_dim
+        value_offset = (
+            (self.geometry.num_entries + start_entry) * element_stride
+            + position * self.geometry.head_dim
+        )
+        key_destination = torch.as_strided(
+            self._host_slab,
+            size=(count, self.geometry.head_dim),
+            stride=(element_stride, 1),
+            storage_offset=key_offset,
+        )
+        value_destination = torch.as_strided(
+            self._host_slab,
+            size=(count, self.geometry.head_dim),
+            stride=(element_stride, 1),
+            storage_offset=value_offset,
+        )
+        key_destination.copy_(self._new_kv_host_keys[start_entry:start_entry + count])
+        value_destination.copy_(
+            self._new_kv_host_values[start_entry:start_entry + count]
+        )
+
+    def _flush_batched_new_kv(self, batch_id: int) -> None:
+        pending = self._batched_new_kv_pending.pop(batch_id, None)
+        if pending is None:
+            return
+        done, decode_step, position, entries = pending
+        wait_started = time.perf_counter() if self.metrics_enabled else None
+        done.synchronize()
+        if wait_started is not None:
+            self.metrics["host_ready_wait_wall_seconds"] += (
+                time.perf_counter() - wait_started
+            )
+        scatter_started = time.perf_counter() if self.metrics_enabled else None
+        self._scatter_batched_new_kv_to_host(
+            start_entry=entries[0], entries=entries, position=position
+        )
+        if scatter_started is not None:
+            self.metrics["new_kv_host_scatter_wall_seconds"] += (
+                time.perf_counter() - scatter_started
+            )
+            self.metrics["new_kv_host_scatter_calls"] += 2
+        self._capture_new_kv_host_rows(
+            entries, decode_step=decode_step, position=position
+        )
+
+    def _flush_all_batched_new_kv(self) -> None:
+        for batch_id in sorted(tuple(self._batched_new_kv_pending)):
+            self._flush_batched_new_kv(batch_id)
+
+    def _schedule_batched_new_kv_d2h(
+        self,
+        *,
+        entries: list[int],
+        old_length: int,
+        key_states: list[torch.Tensor],
+        value_states: list[torch.Tensor],
+    ) -> None:
+        if any(
+            tensor is None
+            for tensor in (
+                self._new_kv_gpu_keys,
+                self._new_kv_gpu_values,
+                self._new_kv_host_keys,
+                self._new_kv_host_values,
+            )
+        ):
+            raise AssertionError("new KV staging buffers are missing")
+        start_entry = entries[0]
+        stop_entry = entries[-1] + 1
+        if entries != list(range(start_entry, stop_entry)):
+            raise AssertionError("layer entries must be contiguous")
+        decode_step = (
+            old_length - self._prompt_length + 1
+            if self._prompt_length is not None
+            else old_length + 1
+        )
+        pack_started = time.perf_counter() if self.metrics_enabled else None
+        pack_event_start = self._event(timing=True) if self.metrics_enabled else None
+        if pack_event_start is not None:
+            pack_event_start.record(torch.cuda.current_stream(self.device))
+        torch.cat(
+            [key[0, 0] for key in key_states],
+            dim=0,
+            out=self._new_kv_gpu_keys[start_entry:stop_entry],
+        )
+        torch.cat(
+            [value[0, 0] for value in value_states],
+            dim=0,
+            out=self._new_kv_gpu_values[start_entry:stop_entry],
+        )
+        if self.metrics_enabled:
+            pack_event_end = self._event(timing=True)
+            pack_event_end.record(torch.cuda.current_stream(self.device))
+            self._timing_events.append(
+                ("new_kv_gpu_staging", pack_event_start, pack_event_end)
+            )
+            self.metrics["new_kv_gpu_staging_wall_seconds"] += (
+                time.perf_counter() - pack_started
+            )
+            self.metrics["new_kv_gpu_staging_calls"] += 2
+
+        if self.new_kv_d2h_granularity == "token" and stop_entry < self.geometry.num_entries:
+            return
+        if self.new_kv_d2h_granularity == "token":
+            batch_id = 0
+            batch_entries = tuple(range(self.geometry.num_entries))
+            batch_start = 0
+            batch_stop = self.geometry.num_entries
+        else:
+            batch_id = start_entry // len(entries)
+            batch_entries = tuple(entries)
+            batch_start = start_entry
+            batch_stop = stop_entry
+        if batch_id in self._batched_new_kv_pending:
+            self._flush_batched_new_kv(batch_id)
+
+        enqueue_started = time.perf_counter() if self.metrics_enabled else None
+        compute_stream = torch.cuda.current_stream(self.device)
+        ready = self._event()
+        ready.record(compute_stream)
+        with torch.cuda.stream(self.eviction_stream):
+            self.eviction_stream.wait_event(ready)
+            if self.metrics_enabled:
+                d2h_start = self._event(timing=True)
+                d2h_end = self._event(timing=True)
+                d2h_start.record(self.eviction_stream)
+            self._new_kv_host_keys[batch_start:batch_stop].copy_(
+                self._new_kv_gpu_keys[batch_start:batch_stop], non_blocking=True
+            )
+            self._new_kv_host_values[batch_start:batch_stop].copy_(
+                self._new_kv_gpu_values[batch_start:batch_stop], non_blocking=True
+            )
+            if self.metrics_enabled:
+                d2h_end.record(self.eviction_stream)
+                self._timing_events.append(("new_kv_d2h", d2h_start, d2h_end))
+            done = self._event()
+            done.record(self.eviction_stream)
+        self._new_kv_gpu_keys[batch_start:batch_stop].record_stream(
+            self.eviction_stream
+        )
+        self._new_kv_gpu_values[batch_start:batch_stop].record_stream(
+            self.eviction_stream
+        )
+        self._batched_new_kv_pending[batch_id] = (
+            done,
+            decode_step,
+            old_length,
+            batch_entries,
+        )
+        for entry in batch_entries:
+            self._host_write_done[entry] = done
+        if self.metrics_enabled:
+            elements = 2 * len(batch_entries) * self.geometry.head_dim
+            self.metrics["d2h_bytes"] += elements * self._new_kv_gpu_keys.element_size()
+            self.metrics["d2h_copy_calls"] += 2
+            self.metrics["new_kv_d2h_ready_events"] += 1
+            self.metrics["new_kv_d2h_done_events"] += 1
+            self.metrics["new_kv_d2h_enqueue_wall_seconds"] += (
+                time.perf_counter() - enqueue_started
+            )
 
     def enable_selection_trace(self, enabled: bool = True) -> None:
         super().enable_selection_trace(enabled)
@@ -1196,17 +1478,31 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         if len(set(old_lengths)) != 1:
             raise AssertionError("layer KV entries have unequal logical lengths")
         old_length = old_lengths[0]
+        decode_step = (
+            old_length - self._prompt_length + 1
+            if self._prompt_length is not None
+            else old_length + 1
+        )
 
         update_started = time.perf_counter() if self.metrics_enabled else None
         phase_started = time.perf_counter() if self.metrics_enabled else None
-        for entry in entries:
-            host_ready = self._host_write_done[entry]
-            if host_ready is not None:
-                host_ready.synchronize()
-        if self.metrics_enabled:
+        if self.batched_new_kv_d2h:
+            batch_id = (
+                0
+                if self.new_kv_d2h_granularity == "token"
+                else entries[0] // len(entries)
+            )
+            self._flush_batched_new_kv(batch_id)
+        else:
+            for entry in entries:
+                host_ready = self._host_write_done[entry]
+                if host_ready is not None:
+                    host_ready.synchronize()
+        if self.metrics_enabled and not self.batched_new_kv_d2h:
             self.metrics["host_ready_wait_wall_seconds"] += (
                 time.perf_counter() - phase_started
             )
+        self._verify_new_kv_before_read(entries, decode_step)
 
         layer_positions: list[list[torch.Tensor]] = []
         union_started = time.perf_counter() if self.metrics_enabled else None
@@ -1734,13 +2030,27 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 }
             )
 
-        for entry, new_length, key, value, total_length in zip(
-            entries, new_lengths, key_states, value_states, group_total_lengths
-        ):
+        for entry, total_length in zip(entries, group_total_lengths):
             self._last_query_head_lengths[entry] = (
                 total_length,
             ) * self.num_query_heads_per_kv
-            self._schedule_d2h(entry, old_length, new_length, key, value)
+        if self.batched_new_kv_d2h:
+            self._schedule_batched_new_kv_d2h(
+                entries=entries,
+                old_length=old_length,
+                key_states=key_states,
+                value_states=value_states,
+            )
+        else:
+            for entry, new_length, key, value in zip(
+                entries, new_lengths, key_states, value_states
+            ):
+                if self._capture_new_kv_trace:
+                    self._new_kv_control_pending[entry] = (
+                        decode_step,
+                        old_length,
+                    )
+                self._schedule_d2h(entry, old_length, new_length, key, value)
 
         if self.metrics_enabled:
             self.metrics["append_and_d2h_enqueue_wall_seconds"] += (
@@ -1795,6 +2105,24 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             group_total_lengths,
         )
 
+    def synchronize(self) -> None:
+        super().synchronize()
+        if self.batched_new_kv_d2h:
+            self._flush_all_batched_new_kv()
+        elif self._capture_new_kv_trace and self._new_kv_control_pending:
+            pending_by_step: dict[tuple[int, int], list[int]] = {}
+            for entry, (decode_step, position) in self._new_kv_control_pending.items():
+                pending_by_step.setdefault((decode_step, position), []).append(entry)
+            self._new_kv_control_pending = {}
+            for (decode_step, position), pending_entries in sorted(
+                pending_by_step.items()
+            ):
+                self._capture_new_kv_host_rows(
+                    tuple(sorted(pending_entries)),
+                    decode_step=decode_step,
+                    position=position,
+                )
+
     def state_snapshot(self) -> dict[str, Any]:
         snapshot = super().state_snapshot()
         quant_bytes = 0
@@ -1838,6 +2166,28 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 ),
                 "gpu_compact_gqa_union": self.gpu_compact_gqa_union,
                 "gpu_union_validate_cpu": self.gpu_union_validate_cpu,
+                "batched_new_kv_d2h": self.batched_new_kv_d2h,
+                "new_kv_d2h_granularity": (
+                    self.new_kv_d2h_granularity
+                    if self.batched_new_kv_d2h
+                    else None
+                ),
+                "new_kv_gpu_staging_allocated_bytes": sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in (
+                        self._new_kv_gpu_keys,
+                        self._new_kv_gpu_values,
+                    )
+                    if tensor is not None
+                ),
+                "new_kv_pinned_host_staging_allocated_bytes": sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in (
+                        self._new_kv_host_keys,
+                        self._new_kv_host_values,
+                    )
+                    if tensor is not None
+                ),
                 "gpu_group_membership_allocated_bytes": (
                     0
                     if self._gpu_group_membership is None

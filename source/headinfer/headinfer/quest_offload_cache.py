@@ -229,6 +229,7 @@ class QuestTopKOffloadedCache(Cache):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ) -> None:
+        enqueue_started = time.perf_counter() if self.metrics_enabled else None
         source_key = key_states.detach()
         source_value = value_states.detach()
         compute_stream = torch.cuda.current_stream(self.device)
@@ -236,12 +237,21 @@ class QuestTopKOffloadedCache(Cache):
         ready.record(compute_stream)
         with torch.cuda.stream(self.eviction_stream):
             self.eviction_stream.wait_event(ready)
+            if self.metrics_enabled:
+                d2h_start = self._event(timing=True)
+                d2h_end = self._event(timing=True)
+                d2h_start.record(self.eviction_stream)
             self._host_tensor("key", entry)[..., host_start:host_end, :].copy_(
                 source_key, non_blocking=True
             )
             self._host_tensor("value", entry)[..., host_start:host_end, :].copy_(
                 source_value, non_blocking=True
             )
+            if self.metrics_enabled:
+                d2h_end.record(self.eviction_stream)
+                self._timing_events.append(
+                    ("new_kv_d2h", d2h_start, d2h_end)
+                )
             done = self._event()
             done.record(self.eviction_stream)
         source_key.record_stream(self.eviction_stream)
@@ -251,6 +261,11 @@ class QuestTopKOffloadedCache(Cache):
             elements = 2 * (host_end - host_start) * self.geometry.head_dim
             self.metrics["d2h_bytes"] += elements * source_key.element_size()
             self.metrics["d2h_copy_calls"] += 2
+            self.metrics["new_kv_d2h_ready_events"] += 1
+            self.metrics["new_kv_d2h_done_events"] += 1
+            self.metrics["new_kv_d2h_enqueue_wall_seconds"] += (
+                time.perf_counter() - enqueue_started
+            )
 
     def _build_metadata(self, entry: int, key_states: torch.Tensor) -> None:
         keys = key_states[0, 0]
@@ -975,6 +990,19 @@ class QuestTopKOffloadedCache(Cache):
             for tensor in tensors
             if tensor is not None
         )
+        execution_tensors = (
+            [self._gpu_pack_keys, self._gpu_pack_values]
+            + [
+                tensor
+                for tensor in (
+                    self._gpu_layer_flat_history_keys,
+                    self._gpu_layer_flat_history_values,
+                    self._gpu_layer_flat_attention_keys,
+                    self._gpu_layer_flat_attention_values,
+                )
+                if tensor is not None
+            ]
+        )
         return {
             "logical_length": self.get_seq_length(),
             "allocated_capacity": self.allocated_capacity,
@@ -982,6 +1010,10 @@ class QuestTopKOffloadedCache(Cache):
             "host_slab_bytes": self._host_slab.numel() * self._host_slab.element_size(),
             "host_slab_pinned": self._host_slab.is_pinned(),
             "metadata_gpu_bytes": metadata_bytes,
+            "execution_buffer_gpu_bytes": sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in execution_tensors
+            ),
             "block_size": self.block_size,
             "budget_fraction": self.budget_fraction,
             "selection_interval": self.selection_interval,
