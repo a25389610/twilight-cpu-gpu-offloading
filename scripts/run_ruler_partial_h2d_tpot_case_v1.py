@@ -87,6 +87,19 @@ def parse_args() -> argparse.Namespace:
         default="token",
     )
     parser.add_argument(
+        "--twilight-post-selection-pipeline",
+        action="store_true",
+        help=(
+            "Pipeline only GPU union/index handoff, CPU decode/gather, and "
+            "selected-KV H2D after the Top-p membership boundary."
+        ),
+    )
+    parser.add_argument(
+        "--twilight-post-selection-groups-per-chunk",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
         "--capture-twilight-new-kv-trace",
         action="store_true",
         help="Diagnostic-only per-step/layer/KV-head CPU slab hashes.",
@@ -476,6 +489,22 @@ def main() -> int:
         and args.quest_layer_batched_selection
     ):
         raise ValueError("batched new-KV D2H requires layer-batched Twilight GQA")
+    if args.twilight_post_selection_groups_per_chunk <= 0:
+        raise ValueError("post-selection groups per chunk must be positive")
+    if args.twilight_post_selection_pipeline and not (
+        args.twilight_gpu_compact_gqa_union
+        and args.twilight_gqa_group
+        and args.twilight_cpu_flat_gather
+        and args.twilight_direct_attention_layout
+        and args.twilight_gather_h2d_chunks > 0
+        and not args.twilight_cpu_native_gather
+        and not args.twilight_cpu_run_gather
+        and not args.twilight_previous_token_resident_cache
+    ):
+        raise ValueError(
+            "post-selection pipeline requires the current GPU-union "
+            "flat/direct/chunk path"
+        )
     if args.capture_twilight_new_kv_trace and args.twilight_top_p is None:
         raise ValueError("new-KV trace requires Twilight")
     if (
@@ -614,6 +643,10 @@ def main() -> int:
             gpu_union_validate_cpu=args.twilight_gpu_union_validate_cpu,
             batched_new_kv_d2h=args.twilight_batched_new_kv_d2h,
             new_kv_d2h_granularity=args.twilight_new_kv_d2h_granularity,
+            post_selection_pipeline=args.twilight_post_selection_pipeline,
+            post_selection_groups_per_chunk=(
+                args.twilight_post_selection_groups_per_chunk
+            ),
             sparse_gather_stabilized=args.sparse_gather_stabilized,
             per_head_varlen_attention_reference=(
                 args.twilight_per_head_varlen_reference
@@ -1132,6 +1165,16 @@ def main() -> int:
         "twilight_new_kv_d2h_granularity": (
             args.twilight_new_kv_d2h_granularity
             if args.twilight_batched_new_kv_d2h
+            else None
+        ),
+        "twilight_post_selection_pipeline": (
+            args.twilight_post_selection_pipeline
+            if args.twilight_top_p is not None
+            else None
+        ),
+        "twilight_post_selection_groups_per_chunk": (
+            args.twilight_post_selection_groups_per_chunk
+            if args.twilight_post_selection_pipeline
             else None
         ),
         "twilight_new_kv_trace": (
