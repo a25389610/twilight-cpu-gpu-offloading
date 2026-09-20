@@ -163,6 +163,8 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         gpu_union_validate_cpu: bool = False,
         batched_new_kv_d2h: bool = False,
         new_kv_d2h_granularity: str = "token",
+        post_selection_pipeline: bool = False,
+        post_selection_groups_per_chunk: int = 1,
         **kwargs: Any,
     ) -> None:
         if candidate_token_budget <= 0:
@@ -195,6 +197,10 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         self.gpu_compact_gqa_union = bool(gpu_compact_gqa_union)
         self.gpu_union_validate_cpu = bool(gpu_union_validate_cpu)
         self.batched_new_kv_d2h = bool(batched_new_kv_d2h)
+        self.post_selection_pipeline = bool(post_selection_pipeline)
+        self.post_selection_groups_per_chunk = int(
+            post_selection_groups_per_chunk
+        )
         if new_kv_d2h_granularity not in {"layer", "token"}:
             raise ValueError("new KV D2H granularity must be 'layer' or 'token'")
         self.new_kv_d2h_granularity = new_kv_d2h_granularity
@@ -202,6 +208,23 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             raise ValueError("GPU compact union requires GQA group execution")
         if self.gpu_union_validate_cpu and not self.gpu_compact_gqa_union:
             raise ValueError("GPU union CPU validation requires GPU compact union")
+        if self.post_selection_groups_per_chunk <= 0:
+            raise ValueError("post-selection groups per chunk must be positive")
+        if self.post_selection_pipeline and not (
+            self.gpu_compact_gqa_union
+            and gqa_groupwise_execution
+            and cpu_flat_gather
+            and direct_attention_layout
+            and gather_h2d_chunks > 0
+            and not cpu_native_gather
+            and not cpu_run_gather
+            and not previous_token_resident_cache
+        ):
+            raise ValueError(
+                "post-selection pipeline requires the current GPU-union "
+                "GQA flat/direct/chunk path without native/run gather or "
+                "resident reuse"
+            )
         if self.cpu_run_gather:
             if not (cpu_flat_gather and direct_attention_layout and gqa_groupwise_execution and gather_h2d_chunks > 0) or cpu_native_gather:
                 raise ValueError('run gather requires flat/direct/GQA chunk pipeline without native gather')
@@ -295,6 +318,21 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             Optional[tuple[int, ...]]
         ] = [None] * self.geometry.num_entries
         self._gpu_group_membership: Optional[torch.Tensor] = None
+        self._post_selection_host_membership: Optional[torch.Tensor] = None
+        self._post_selection_pending: dict[int, dict[str, Any]] = {}
+        self._post_selection_host_starts: dict[int, float] = {}
+        self._post_selection_timeline_events: list[dict[str, Any]] = []
+        self._post_selection_timeline: list[dict[str, Any]] = []
+        self._post_selection_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.post_selection_pipeline
+            else None
+        )
+        self._selected_kv_h2d_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.post_selection_pipeline
+            else None
+        )
         self._capture_budget_trace = False
         self._budget_trace: list[dict[str, Any]] = []
         self._group_union_trace: list[dict[str, Any]] = []
@@ -702,6 +740,45 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             return None
         return self._record_phase_start()
 
+    def reset_metrics(self) -> None:
+        super().reset_metrics()
+        self._post_selection_timeline_events = []
+        self._post_selection_timeline = []
+
+    def resolve_metrics(self) -> Dict[str, Any]:
+        metrics = super().resolve_metrics()
+        resolved: list[dict[str, Any]] = []
+        for item in self._post_selection_timeline_events:
+            origin = item["origin"]
+            chunks = []
+            for chunk in item["chunks"]:
+                resolved_chunk = {
+                    key: value
+                    for key, value in chunk.items()
+                    if not key.endswith("_event") and key != "done"
+                }
+                for prefix in ("union", "index_d2h", "selected_kv_h2d"):
+                    start = chunk.get(f"{prefix}_start_event")
+                    end = chunk.get(f"{prefix}_end_event")
+                    if start is not None and end is not None:
+                        resolved_chunk[f"{prefix}_start_ms"] = origin.elapsed_time(
+                            start
+                        )
+                        resolved_chunk[f"{prefix}_end_ms"] = origin.elapsed_time(end)
+                chunks.append(resolved_chunk)
+            resolved.append(
+                {
+                    "layer": item["layer"],
+                    "decode_step": item["decode_step"],
+                    "chunks": chunks,
+                }
+            )
+        self._post_selection_timeline = resolved
+        if resolved:
+            metrics["post_selection_timeline"] = resolved
+        self._post_selection_timeline_events = []
+        return metrics
+
     def prepare_layer_selection(
         self,
         *,
@@ -983,6 +1060,29 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 desired, target_total, int(order.shape[-1])
             )
         )
+        self._record_phase_end("twilight_membership_decision", subphase)
+        self._record_phase_end("twilight_selection_core", selection_cuda_phase)
+        selection_done: Optional[torch.cuda.Event] = None
+        if self.post_selection_pipeline or self.metrics_enabled:
+            selection_done = self._event()
+            selection_done.record(torch.cuda.current_stream(self.device))
+        timeline_origin = selection_done
+        timeline_host_origin = time.perf_counter()
+        if self.metrics_enabled:
+            # Diagnostic-only wall boundary. Formal D2--D32 does not synchronize
+            # here; the post-selection stream waits on the recorded event instead.
+            assert selection_done is not None
+            selection_done.synchronize()
+            assert selector_wall_started is not None
+            self.metrics["twilight_selection_core_wall_seconds"] += (
+                time.perf_counter() - selector_wall_started
+            )
+            timeline_origin = self._event(timing=True)
+            timeline_origin.record(torch.cuda.current_stream(self.device))
+            timeline_host_origin = time.perf_counter()
+            self._post_selection_host_starts[entries[0] // groups] = (
+                timeline_host_origin
+            )
         max_allocated = (
             int(order.shape[-1])
             if self.budget_mode == "dynamic"
@@ -993,7 +1093,134 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
         rows: Optional[torch.Tensor] = None
         group_positions: Optional[list[torch.Tensor]] = None
         transferred_bytes = 0
-        if self.gpu_compact_gqa_union:
+        if self.gpu_compact_gqa_union and self.post_selection_pipeline:
+            if self._post_selection_stream is None:
+                raise AssertionError("post-selection stream is missing")
+            if timeline_origin is None:
+                raise AssertionError("Selection barrier event is missing")
+            required_shape = (groups, self.geometry.max_cache_len + 1)
+            if (
+                self._gpu_group_membership is None
+                or tuple(self._gpu_group_membership.shape) != required_shape
+            ):
+                self._gpu_group_membership = torch.empty(
+                    required_shape, dtype=torch.bool, device=self.device
+                )
+            host_shape = (groups, self.geometry.max_cache_len)
+            if (
+                self._post_selection_host_membership is None
+                or tuple(self._post_selection_host_membership.shape) != host_shape
+            ):
+                self._post_selection_host_membership = torch.empty(
+                    host_shape, dtype=torch.bool, device="cpu", pin_memory=True
+                )
+            layer_index = entries[0] // groups
+            if layer_index in self._post_selection_pending:
+                raise AssertionError("unconsumed post-selection layer state")
+            chunk_records: list[dict[str, Any]] = []
+            chunk_size = min(self.post_selection_groups_per_chunk, groups)
+            with torch.cuda.stream(self._post_selection_stream):
+                self._post_selection_stream.wait_event(timeline_origin)
+                # Build all GQA unions in one batched GPU operation.  Splitting
+                # gather/scatter by group made the small CUDA kernels dominate
+                # the attempted overlap (especially at one group per chunk).
+                # Only the bitmap handoff remains chunked, so the CPU can start
+                # decoding chunk 0 while later bitmap slices are copied D2H.
+                union_start = self._event(timing=True) if self.metrics_enabled else None
+                union_end = self._event(timing=True) if self.metrics_enabled else None
+                if union_start is not None:
+                    union_start.record(self._post_selection_stream)
+                ranked_prefix = torch.gather(
+                    candidate_positions,
+                    -1,
+                    order[..., :max_allocated],
+                )
+                active = torch.arange(
+                    max_allocated, device=self.device
+                ).view(1, 1, -1) < allocated.unsqueeze(-1)
+                sentinel = torch.full_like(ranked_prefix, old_length)
+                scatter_positions = torch.where(active, ranked_prefix, sentinel)
+                membership = self._gpu_group_membership[:, : old_length + 1]
+                membership.zero_()
+                membership.scatter_(1, scatter_positions.flatten(1), True)
+                membership[:, :sink_end] = True
+                membership[:, recent_start:old_length] = True
+                if union_end is not None:
+                    union_end.record(self._post_selection_stream)
+                for group_start in range(0, groups, chunk_size):
+                    group_stop = min(groups, group_start + chunk_size)
+                    index_start = self._event(timing=True) if self.metrics_enabled else None
+                    index_end = self._event(timing=True) if self.metrics_enabled else None
+                    if index_start is not None:
+                        index_start.record(self._post_selection_stream)
+                    self._post_selection_host_membership[
+                        group_start:group_stop, :old_length
+                    ].copy_(
+                        membership[group_start:group_stop, :old_length],
+                        non_blocking=True,
+                    )
+                    if index_end is not None:
+                        index_end.record(self._post_selection_stream)
+                    done = self._event()
+                    done.record(self._post_selection_stream)
+                    chunk_records.append(
+                        {
+                            "group_start": group_start,
+                            "group_stop": group_stop,
+                            "done": done,
+                            "union_start_event": (
+                                union_start if group_start == 0 else None
+                            ),
+                            "union_end_event": (
+                                union_end if group_start == 0 else None
+                            ),
+                            "index_d2h_start_event": index_start,
+                            "index_d2h_end_event": index_end,
+                        }
+                    )
+            for tensor in (candidate_positions, order, allocated):
+                tensor.record_stream(self._post_selection_stream)
+            self._post_selection_pending[layer_index] = {
+                "old_length": old_length,
+                "selection_done": timeline_origin,
+                "host_origin": timeline_host_origin,
+                "origin": timeline_origin,
+                "chunks": chunk_records,
+            }
+            transferred_bytes += groups * old_length
+            sync_started = time.perf_counter() if self.metrics_enabled else None
+
+            need_counts = (
+                self.metrics_enabled
+                or self._capture_budget_trace
+                or self._capture_selection_trace
+                or self.gpu_union_validate_cpu
+            )
+            if need_counts:
+                count_transfer = torch.stack((allocated, desired), dim=-1).cpu()
+                allocated_cpu = count_transfer[..., 0]
+                desired_cpu = count_transfer[..., 1]
+                transferred_bytes += (
+                    count_transfer.numel() * count_transfer.element_size()
+                )
+            need_per_q_rows = (
+                self._capture_budget_trace
+                or self._capture_selection_trace
+                or self.gpu_union_validate_cpu
+            )
+            if need_per_q_rows:
+                diagnostic_ranked_prefix = torch.gather(
+                    candidate_positions,
+                    -1,
+                    order[..., :max_allocated],
+                )
+                rows = diagnostic_ranked_prefix.reshape(
+                    groups * query_heads, -1
+                ).cpu()
+                transferred_bytes += rows.numel() * rows.element_size()
+            sync_finished = time.perf_counter() if self.metrics_enabled else None
+        elif self.gpu_compact_gqa_union:
+            union_subphase = self._record_detailed_phase_start()
             # The consumer needs one sorted union per KV head, not four sorted
             # per-Query-head rows.  Scatter the exact active prefixes into a
             # reusable GPU membership map.  The compact bool map preserves set
@@ -1022,7 +1249,7 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             membership.scatter_(1, scatter_positions.flatten(1), True)
             membership[:, :sink_end] = True
             membership[:, recent_start:old_length] = True
-            self._record_phase_end("twilight_gpu_gqa_union", subphase)
+            self._record_phase_end("twilight_gpu_gqa_union", union_subphase)
             self._record_phase_end(
                 "twilight_selection_before_d2h", selection_cuda_phase
             )
@@ -1064,6 +1291,7 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 rows = ranked_prefix.reshape(groups * query_heads, -1).cpu()
                 transferred_bytes += rows.numel() * rows.element_size()
         else:
+            subphase = self._record_detailed_phase_start()
             if self.fused_final_indices:
                 from .twilight_fused_indices import fused_gather_mask
                 masked_positions = fused_gather_mask(
@@ -1431,6 +1659,410 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             raise AssertionError("Twilight matched budget drifted from Quest")
         return positions
 
+    def _consume_post_selection_pipeline(
+        self,
+        *,
+        key_states: list[torch.Tensor],
+        value_states: list[torch.Tensor],
+        queries: list[torch.Tensor],
+        entries: list[int],
+        old_length: int,
+        new_lengths: list[int],
+        decode_step: int,
+        update_started: Optional[float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, tuple[int, ...]]:
+        """Consume chunked post-Selection work after the Top-p barrier.
+
+        Selection has already recorded ``selection_done``.  The GPU union/index
+        stream waits on that event, CPU decode/gather waits on each chunk's D2H
+        completion, and selected-KV H2D uses a separate stream.  Consequently no
+        post-Selection operation can overlap backwards into Selection, while
+        later chunks can overlap GPU index work, CPU gather, and PCIe H2D.
+        """
+        if not self.post_selection_pipeline:
+            raise RuntimeError("post-selection pipeline is disabled")
+        if self._selected_kv_h2d_stream is None:
+            raise AssertionError("selected-KV H2D stream is missing")
+        if self._post_selection_host_membership is None:
+            raise AssertionError("post-selection host membership is missing")
+        group_count = len(entries)
+        layer_index = entries[0] // group_count
+        pending = self._post_selection_pending.pop(layer_index, None)
+        if pending is None or pending["old_length"] != old_length:
+            raise AssertionError("prepared post-selection chunks are missing")
+
+        slot = self._layer_flat_cursor
+        self._layer_flat_cursor = 1 - self._layer_flat_cursor
+        wait_started = time.perf_counter() if self.metrics_enabled else None
+        ready = self._layer_flat_ready[slot]
+        if ready is not None:
+            ready.synchronize()
+        if self.metrics_enabled:
+            assert wait_started is not None
+            self.metrics["pack_ready_wait_wall_seconds"] += (
+                time.perf_counter() - wait_started
+            )
+
+        host_flat_key = self._host_layer_flat_keys[slot]
+        host_flat_value = self._host_layer_flat_values[slot]
+        host_rows = self._host_layer_flat_row_indices[slot]
+        assert self._gpu_layer_flat_attention_keys is not None
+        assert self._gpu_layer_flat_attention_values is not None
+
+        group_positions: list[torch.Tensor] = []
+        new_token_offsets: list[int] = []
+        attention_offset = 0
+        pipeline_enqueue_seconds = 0.0
+        cpu_gather_seconds = 0.0
+        cpu_decode_seconds = 0.0
+        index_wait_seconds = 0.0
+        host_origin = float(pending["host_origin"])
+        timeline_chunks: list[dict[str, Any]] = []
+
+        # The transfer stream may otherwise race a previous default-stream user
+        # of the reusable attention buffer.  This dependency is also the hard
+        # proof that selected-KV H2D starts strictly after Selection completion.
+        self._selected_kv_h2d_stream.wait_event(pending["selection_done"])
+        for chunk in pending["chunks"]:
+            chunk_wait_started = time.perf_counter()
+            chunk["done"].synchronize()
+            chunk_wait_finished = time.perf_counter()
+            index_wait_seconds += chunk_wait_finished - chunk_wait_started
+
+            decode_started = time.perf_counter()
+            chunk_positions = [
+                torch.from_numpy(np.flatnonzero(row.numpy()))
+                for row in self._post_selection_host_membership[
+                    chunk["group_start"] : chunk["group_stop"], :old_length
+                ]
+            ]
+            decode_finished = time.perf_counter()
+            cpu_decode_seconds += decode_finished - decode_started
+
+            chunk_attention_start = attention_offset
+            for group_index, selected in zip(
+                range(chunk["group_start"], chunk["group_stop"]),
+                chunk_positions,
+            ):
+                entry = entries[group_index]
+                history_stop = attention_offset + int(selected.numel())
+                torch.add(
+                    selected,
+                    entry * self.geometry.max_cache_len,
+                    out=host_rows[attention_offset:history_stop],
+                )
+                host_rows[history_stop] = 0
+                new_token_offsets.append(history_stop)
+                attention_offset = history_stop + 1
+                group_positions.append(selected)
+                self._cached_twilight_group_positions[entry] = selected
+
+                if self.gpu_union_validate_cpu:
+                    per_q_selected = self._cached_twilight_positions[entry]
+                    if per_q_selected is None:
+                        raise AssertionError(
+                            "GPU union validation requires retained per-Q rows"
+                        )
+                    sink_end = min(self.sink_tokens, old_length)
+                    recent_start = max(
+                        sink_end, old_length - max(0, self.recent_tokens - 1)
+                    )
+                    sink_cpu = torch.arange(sink_end, dtype=torch.long)
+                    recent_cpu = torch.arange(
+                        recent_start, old_length, dtype=torch.long
+                    )
+                    cpu_positions = [
+                        torch.cat((sink_cpu, row, recent_cpu))
+                        for row in per_q_selected
+                    ]
+                    expected = (
+                        self._cpu_token_union(cpu_positions, old_length)
+                        if self.cpu_bitmap_union
+                        else torch.unique(torch.cat(cpu_positions), sorted=True)
+                    )
+                    if not torch.equal(selected, expected):
+                        raise AssertionError(
+                            f"post-selection GPU union mismatch for entry {entry}"
+                        )
+
+            chunk_attention_stop = attention_offset
+            gather_started = time.perf_counter()
+            torch.index_select(
+                self._host_key_rows,
+                0,
+                host_rows[chunk_attention_start:chunk_attention_stop],
+                out=host_flat_key[chunk_attention_start:chunk_attention_stop],
+            )
+            torch.index_select(
+                self._host_value_rows,
+                0,
+                host_rows[chunk_attention_start:chunk_attention_stop],
+                out=host_flat_value[chunk_attention_start:chunk_attention_stop],
+            )
+            gather_finished = time.perf_counter()
+            cpu_gather_seconds += gather_finished - gather_started
+
+            enqueue_started = time.perf_counter()
+            h2d_start = self._event(timing=True) if self.metrics_enabled else None
+            h2d_end = self._event(timing=True) if self.metrics_enabled else None
+            with torch.cuda.stream(self._selected_kv_h2d_stream):
+                if h2d_start is not None:
+                    h2d_start.record(self._selected_kv_h2d_stream)
+                self._gpu_layer_flat_attention_keys[
+                    chunk_attention_start:chunk_attention_stop, 0
+                ].copy_(
+                    host_flat_key[chunk_attention_start:chunk_attention_stop],
+                    non_blocking=True,
+                )
+                self._gpu_layer_flat_attention_values[
+                    chunk_attention_start:chunk_attention_stop, 0
+                ].copy_(
+                    host_flat_value[chunk_attention_start:chunk_attention_stop],
+                    non_blocking=True,
+                )
+                if h2d_end is not None:
+                    h2d_end.record(self._selected_kv_h2d_stream)
+            enqueue_finished = time.perf_counter()
+            pipeline_enqueue_seconds += enqueue_finished - enqueue_started
+            if self.metrics_enabled:
+                assert h2d_start is not None and h2d_end is not None
+                self._timing_events.append(("h2d", h2d_start, h2d_end))
+                chunk_rows = chunk_attention_stop - chunk_attention_start
+                self.metrics["h2d_bytes"] += (
+                    2
+                    * chunk_rows
+                    * self.geometry.head_dim
+                    * key_states[0].element_size()
+                )
+                self.metrics["h2d_copy_calls"] += 2
+            chunk.update(
+                {
+                    "cpu_index_wait_start_ms": 1000.0
+                    * (chunk_wait_started - host_origin),
+                    "cpu_index_wait_end_ms": 1000.0
+                    * (chunk_wait_finished - host_origin),
+                    "cpu_decode_start_ms": 1000.0
+                    * (decode_started - host_origin),
+                    "cpu_decode_end_ms": 1000.0
+                    * (decode_finished - host_origin),
+                    "cpu_gather_start_ms": 1000.0
+                    * (gather_started - host_origin),
+                    "cpu_gather_end_ms": 1000.0
+                    * (gather_finished - host_origin),
+                    "selected_kv_h2d_start_event": h2d_start,
+                    "selected_kv_h2d_end_event": h2d_end,
+                    "attention_row_start": chunk_attention_start,
+                    "attention_row_stop": chunk_attention_stop,
+                }
+            )
+            timeline_chunks.append(chunk)
+
+        copied = self._event()
+        with torch.cuda.stream(self._selected_kv_h2d_stream):
+            copied.record(self._selected_kv_h2d_stream)
+        torch.cuda.current_stream(self.device).wait_event(copied)
+        self._layer_flat_ready[slot] = copied
+
+        group_history_lengths = tuple(
+            int(selected.numel()) for selected in group_positions
+        )
+        group_total_lengths = tuple(length + 1 for length in group_history_lengths)
+        total_history = sum(group_history_lengths)
+        total_attention = sum(group_total_lengths)
+        if total_attention != attention_offset:
+            raise AssertionError("post-selection attention layout length drift")
+
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(group_total_lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for offset, key, value in zip(new_token_offsets, key_states, value_states):
+            self._gpu_layer_flat_attention_keys[offset : offset + 1, 0].copy_(
+                key[0, 0]
+            )
+            self._gpu_layer_flat_attention_values[offset : offset + 1, 0].copy_(
+                value[0, 0]
+            )
+
+        if self._capture_selection_trace:
+            for entry, query in zip(entries, queries):
+                self._selected_positions(
+                    query=query, entry=entry, old_length=old_length
+                )
+            for group_index, (entry, union) in enumerate(
+                zip(entries, group_positions)
+            ):
+                self._group_union_trace.append(
+                    {
+                        "decode_step": decode_step,
+                        "entry": entry,
+                        "layer": layer_index,
+                        "kv_head": group_index,
+                        "selected_history_indices": tuple(
+                            int(value) for value in union.tolist()
+                        ),
+                    }
+                )
+        else:
+            for entry in entries:
+                self._layer_prepared_entries.discard(entry)
+
+        if (
+            self._capture_resident_attention_trace
+            and decode_step in self._resident_attention_trace_steps
+        ):
+            key_cpu = (
+                self._gpu_layer_flat_attention_keys[:total_attention]
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            value_cpu = (
+                self._gpu_layer_flat_attention_values[:total_attention]
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            self._resident_attention_trace.append(
+                {
+                    "decode_step": decode_step,
+                    "layer": layer_index,
+                    "valid_lengths": group_total_lengths,
+                    "key_sha256": hashlib.sha256(
+                        key_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                    "value_sha256": hashlib.sha256(
+                        value_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                }
+            )
+
+        for entry, total_length in zip(entries, group_total_lengths):
+            self._last_query_head_lengths[entry] = (
+                total_length,
+            ) * self.num_query_heads_per_kv
+        append_started = time.perf_counter() if self.metrics_enabled else None
+        if self.batched_new_kv_d2h:
+            self._schedule_batched_new_kv_d2h(
+                entries=entries,
+                old_length=old_length,
+                key_states=key_states,
+                value_states=value_states,
+            )
+        else:
+            for entry, new_length, key, value in zip(
+                entries, new_lengths, key_states, value_states
+            ):
+                self._schedule_d2h(entry, old_length, new_length, key, value)
+
+        if self.metrics_enabled:
+            for chunk in timeline_chunks:
+                union_start = chunk.get("union_start_event")
+                union_end = chunk.get("union_end_event")
+                index_start = chunk.get("index_d2h_start_event")
+                index_end = chunk.get("index_d2h_end_event")
+                if union_start is not None and union_end is not None:
+                    self._timing_events.append(
+                        ("post_selection_union", union_start, union_end)
+                    )
+                if index_start is not None and index_end is not None:
+                    self._timing_events.append(
+                        ("post_selection_index_d2h", index_start, index_end)
+                    )
+            self._post_selection_timeline_events.append(
+                {
+                    "layer": layer_index,
+                    "decode_step": decode_step,
+                    "origin": pending["origin"],
+                    "chunks": timeline_chunks,
+                }
+            )
+            self.metrics["post_selection_index_wait_wall_seconds"] += (
+                index_wait_seconds
+            )
+            self.metrics["twilight_compact_index_decode_wall_seconds"] += (
+                cpu_decode_seconds
+            )
+            self.metrics["host_gather_pack_wall_seconds"] += cpu_gather_seconds
+            self.metrics["h2d_enqueue_wall_seconds"] += pipeline_enqueue_seconds
+            self.metrics["host_gather_layer_calls"] += 1
+            self.metrics["host_gather_primitive_calls"] += 2 * len(timeline_chunks)
+            self.metrics["host_gather_index_select_calls"] += 2 * len(
+                timeline_chunks
+            )
+            self.metrics["host_flat_pack_write_calls"] += 2 * group_count
+            self.metrics["layer_gqa_group_h2d_calls"] += 1
+            self.metrics["twilight_group_union_prepare_wall_seconds"] += (
+                index_wait_seconds + cpu_decode_seconds
+            )
+            self.metrics["twilight_group_union_prepare_calls"] += 1
+            self.metrics["append_and_d2h_enqueue_wall_seconds"] += (
+                0.0
+                if append_started is None
+                else time.perf_counter() - append_started
+            )
+            self.metrics["cache_update_calls"] += group_count
+            self.metrics["layer_gqa_group_update_calls"] += 1
+            per_q_lengths = tuple(
+                length
+                for entry in entries
+                for length in (self._cached_twilight_per_q_lengths[entry] or ())
+            )
+            per_q_history_total = sum(per_q_lengths)
+            protected = min(self.sink_tokens, old_length) + min(
+                self.recent_tokens - 1,
+                max(0, old_length - min(self.sink_tokens, old_length)),
+            )
+            self.metrics["selected_history_tokens_total"] += per_q_history_total
+            if per_q_lengths:
+                self.metrics["selected_history_tokens_per_query_head"] += (
+                    per_q_history_total / len(per_q_lengths)
+                ) * group_count
+                self.metrics["selected_adaptive_tokens_total"] += sum(
+                    max(0, length - protected) for length in per_q_lengths
+                )
+            self.metrics["group_union_history_tokens_total"] += total_history
+            self.metrics["group_union_history_tokens_min_sum"] += min(
+                group_history_lengths
+            )
+            self.metrics["group_union_history_tokens_max_sum"] += max(
+                group_history_lengths
+            )
+            self.metrics["group_union_duplicate_rows_eliminated"] += (
+                per_q_history_total - total_history
+            )
+            self.metrics["group_attention_valid_tokens_total"] += total_attention
+            self.metrics["group_attention_logical_qk_tokens_total"] += sum(
+                length * self.num_query_heads_per_kv
+                for length in group_total_lengths
+            )
+            self.metrics["attention_valid_tokens_total"] += total_attention
+            self.metrics["attention_valid_tokens_min_sum"] += min(
+                group_total_lengths
+            )
+            self.metrics["attention_valid_tokens_max_sum"] += max(
+                group_total_lengths
+            )
+            if update_started is not None:
+                self.metrics["cache_update_total_wall_seconds"] += (
+                    time.perf_counter() - update_started
+                )
+            post_selection_started = self._post_selection_host_starts.pop(
+                layer_index, host_origin
+            )
+            self.metrics["post_selection_exposed_wall_seconds"] += (
+                time.perf_counter() - post_selection_started
+            )
+
+        return (
+            self._gpu_layer_flat_attention_keys[:total_attention],
+            self._gpu_layer_flat_attention_values[:total_attention],
+            cu_seqlens,
+            max(group_total_lengths),
+            group_total_lengths,
+        )
+
     def update_layer_gqa_group_ragged(
         self,
         *,
@@ -1503,6 +2135,17 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 time.perf_counter() - phase_started
             )
         self._verify_new_kv_before_read(entries, decode_step)
+        if self.post_selection_pipeline:
+            return self._consume_post_selection_pipeline(
+                key_states=key_states,
+                value_states=value_states,
+                queries=queries,
+                entries=entries,
+                old_length=old_length,
+                new_lengths=new_lengths,
+                decode_step=decode_step,
+                update_started=update_started,
+            )
 
         layer_positions: list[list[torch.Tensor]] = []
         union_started = time.perf_counter() if self.metrics_enabled else None
@@ -2097,6 +2740,13 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
             self.metrics["cache_update_total_wall_seconds"] += (
                 time.perf_counter() - update_started
             )
+            post_selection_started = self._post_selection_host_starts.pop(
+                layer_index, None
+            )
+            if post_selection_started is not None:
+                self.metrics["post_selection_exposed_wall_seconds"] += (
+                    time.perf_counter() - post_selection_started
+                )
         return (
             self._gpu_layer_flat_attention_keys[:total_attention],
             self._gpu_layer_flat_attention_values[:total_attention],
@@ -2166,6 +2816,20 @@ class TwilightMatchedBudgetOffloadedCache(QuestTopKOffloadedCache):
                 ),
                 "gpu_compact_gqa_union": self.gpu_compact_gqa_union,
                 "gpu_union_validate_cpu": self.gpu_union_validate_cpu,
+                "post_selection_pipeline": self.post_selection_pipeline,
+                "post_selection_groups_per_chunk": (
+                    self.post_selection_groups_per_chunk
+                    if self.post_selection_pipeline
+                    else None
+                ),
+                "post_selection_pinned_index_bytes": (
+                    0
+                    if self._post_selection_host_membership is None
+                    else self._post_selection_host_membership.numel()
+                    * self._post_selection_host_membership.element_size()
+                ),
+                "post_selection_additional_gpu_buffer_bytes": 0,
+                "selection_boundary": "top_p_membership_decision_complete",
                 "batched_new_kv_d2h": self.batched_new_kv_d2h,
                 "new_kv_d2h_granularity": (
                     self.new_kv_d2h_granularity
