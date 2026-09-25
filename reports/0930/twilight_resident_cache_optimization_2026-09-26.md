@@ -3,6 +3,8 @@
 日期：2026-09-26（Asia/Taipei）  
 性質：correctness-first matched systems ablation；原 Selection、GQA union、Attention K/V、KV precision 不變。
 
+此為公開文字鏡像；文末 `results/`、`scripts/` 與 `source/` 路徑均相對於本地 `headinfer/headinfer_reproduction/` 研究 workspace。Raw JSON/CSV/log/trace 未上傳；本文保留條件、量測結果、限制與 source SHA，供獨立閱讀。
+
 ## 問題與原先假設
 
 09/22 的 previous-token resident cache 能將 selected-KV CPU gather/H2D 大幅降低，但當時的 CPU hit/miss mapping、index H2D、GPU hit copy 與每 token snapshot 讓 TPOT 由 120.732 升至 128.963 ms/token（三題單組 matched pair；歷史比較，不能當本輪分母）。本輪測試：在不改輸出邏輯下，合併 CPU mapping 與 GPU hit-copy 工作是否能讓 resident reuse 真正降低 TPOT。
