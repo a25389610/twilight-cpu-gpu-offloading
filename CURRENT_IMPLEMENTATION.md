@@ -1,5 +1,67 @@
 # CURRENT_IMPLEMENTATION
 
+## 2026-09-28 目前首選 32K 低 VRAM 快速路徑
+
+在 Llama-3.2-3B-Instruct、BF16、RTX 5060 Ti 16 GB、Batch 1、32K、
+Twilight dynamic Top-p `p=.90`、Quest `B0=8192` 的已測範圍，
+使用者接受 direct INT4 QK 的 task-level 近似輸出取捨。目前首選路徑是
+previous-token resident cache + GPU mapped CPU KV read + 低 VRAM
+Top-p Graph／GPU mapping 設定，再指定 `--twilight-qk-backend triton`。
+完整 historical KV 仍留在 CPU pinned memory，沒有 full GPU KV mirror。
+CLI 預設 `pytorch` 維持原樣；本次 exact 對照明確使用 `triton_prepare`，direct 需明確 opt-in。
+
+目前保存的最新 breakdown source 三題各兩輪 matched formal D2–D32 TPOT：
+exact **69.137** → direct **55.939 ms/token（-19.09%）**；六組均改善。
+同一 Direct path 的 per-layer Selection temporary peak 約由 106.601 降至
+10.666 MiB，完整 historical KV 仍在 CPU pinned memory。前一時段同機器曾量到
+**65.309 → 52.104 ms/token**，以及另一輪 **68.292 → 55.042 ms/token**；
+這些絕對值不混算，52.104 保留為歷史最快紀錄。130 題 frozen 32K
+RULER 的 paired greedy quality：Macro 兩臂均 **76.1796**，官方逐題
+0 better／130 same／0 worse，EOS 前答案 token 129/130 exact；唯一
+FWE 題的未計分括號頻次數字不同。Selection/logits 不 bit-exact。
+詳細條件與限制見
+[`reports/0930/twilight_direct_qk_preferred_path_2026-09-28.md`](reports/0930/twilight_direct_qk_preferred_path_2026-09-28.md)
+及
+[`reports/0930/twilight_direct_qk_ruler130_quality_2026-09-28.md`](reports/0930/twilight_direct_qk_ruler130_quality_2026-09-28.md)。
+完整 TPOT／Selection／cache／VRAM breakdown 見
+[`reports/0930/twilight_direct_qk_latency_vram_breakdown_2026-09-28.md`](reports/0930/twilight_direct_qk_latency_vram_breakdown_2026-09-28.md)。
+下方舊狀態保留研究沿革。
+
+## 2026-09-26 歷史 exact-preserving resident 路徑
+
+目前最快已測的**維持 CPU offloading 容量前提**的 default-off
+previous-token resident candidate，以 GPU `gpu_bitmap` hit/miss mapping
+和 mapped CPU pinned KV read，取代 CPU mapping、miss gather、index
+handoff 與顯式 selected-KV H2D。完整 32K historical KV 保留在 CPU；
+GPU 僅保留前一步的 selected resident K/V，沒有完整 KV GPU mirror。
+最終 source 凍結後三題 32K `p=.90`、各兩輪同條件 matched TPOT
+**91.890 → 73.787 ms/token（-19.70%）**，六組皆改善，peak GPU
+allocated bytes old/new 各組相同，已測 Selection／Attention／logits
+exact。mapped miss logical payload 仍約 46.807 MiB/token，會經 PCIe，
+不能把取消顯式 H2D 記帳解釋為零傳輸。條件、correctness、容量指標、
+失敗的 full GPU mirror 方向與限制見
+[`reports/0930/twilight_resident_zero_copy_2026-09-26.md`](reports/0930/twilight_resident_zero_copy_2026-09-26.md)。
+此候選尚未跨 Context、`p`、GPU 或 quality cohort 驗證。
+
+**以下 92.262 ms/token 是這次優化前的 previous-token resident
+候選，保留作為同輪 matched control 的來源說明。**
+
+先前已測最快的 **default-off previous-token resident cache candidate**，
+在 `native_compact` mapping、Triton hit copy、GPU compact GQA union、
+`triton_prepare`、4-chunk gather/H2D、token-batched new-KV D2H 之外，
+啟用 `--twilight-resident-snapshot-backend contiguous` 和
+`--twilight-resident-position-snapshot-backend reference`。同份 source
+快照、三題 32K `p=.90`、兩輪交錯 fresh matched pair 的前一最佳→新候選
+TPOT 為 **95.159 → 92.262 ms/token**（六組皆改善，-3.05%），已測
+selection、Attention K/V、new-KV 與 logits exact。完整條件、單機制
+ablation、異常值與限制見
+[`reports/0930/twilight_resident_contiguous_snapshot_2026-09-26.md`](reports/0930/twilight_resident_contiguous_snapshot_2026-09-26.md)。
+本候選仍未跨 Context／`p`／quality cohort 驗證；Selection 後段在最新
+common-origin diagnostic 中仍約 41.294 ms，尚未完成瓶頸轉移。
+
+**以下 2026-09-20 的內容是歷史 source snapshot，保留作為實驗沿革；
+其中的「目前」與 TPOT 不代表 09/26 最新候選。**
+
 這份文件描述目前最新通過 exact correctness gate、三題 matched TPOT 都有
 正收益的 Twilight execution candidate。2026-09-20 最新版在 GPU-side GQA union
 之上再加入 default-off 的 token-level new-KV D2H batching；runner 必須同時傳入
@@ -99,7 +161,7 @@ path。
 
 | option | effective value | 說明 |
 |---|---|---|
-| `qk_backend` | `triton_prepare` | 只融合 candidate packed-K/scale/min gather、INT4 unpack/dequant 與 FP32 K preparation；後續仍走原本 FP32 QK/Top-p 計算。 |
+| `qk_backend` | `triton_prepare`（歷史 exact control）／`triton`（目前首選 approximate） | `triton_prepare` 建立 FP32 estimated K；目前首選 `triton` 將 INT4 prepare 與 QK 融合，需明確 opt-in。 |
 | `quest_layer_batched_selection` / `layer_batched_selection` | `true` | 以 layer 及 GQA group 批次準備 query/Quest metadata。 |
 | `gqa_groupwise_execution` | `true` (`--twilight-gqa-group`) | 將 Q heads 按 KV group 做 union 後進入 varlen attention。 |
 | `twilight_top_p` | `0.90` | 第二輪 approximate-QK 的 dynamic Top-p。 |
@@ -164,7 +226,7 @@ path。
 - `cpu_run_gather=true`：`CpuKVRunGather` run-copy/hybrid path 存在，但 runner 沒有開啟。
 - `fused_final_indices=true`：fused final-index bundle 存在，但最新 command 沒有 `--twilight-fused-final-indices`。
 - `twilight_layer_projection=true`：full-layer QKV projection batching 存在，但 baseline 只有 `layer_rope=true`。
-- `qk_backend=triton`：direct INT4→QK backend 存在，但 baseline 使用 `triton_prepare`。
+- `qk_backend=triton`：direct INT4→QK backend 是目前 32K 低 VRAM 首選 approximate path；`triton_prepare` 保留為 exact control。
 - `previous_token_resident_cache=true`：previous-token selected-KV reuse prototype存在，但目前關閉。
 - `new_kv_d2h_granularity=layer`：layer-level batching存在，但003 pilot TPOT 125.629 ms，慢於token-level 124.281 ms，故目前不用。
 - `full_layer_flat`、`quest_layer_flat_ragged`、`twilight_layer_flat_ragged`、per-head varlen reference、`sparse_gather_stabilized`：均不在最新 coarse command。
@@ -181,7 +243,7 @@ path。
 
 ### Correctness gate 未通過或不符合目前 exact path
 
-- `qk_backend=triton` 的 direct INT4→QK path：diagnostic hashes / checkpoint exact gate 未通過（最大差異曾達 `0.15625`），因此不採用；目前改用 exact-preserving 的 `triton_prepare` 加原本 FP32 QK。
+- `qk_backend=triton` 的 direct INT4→QK path：Selection/logits 不 bit-exact，但在已測 130 題 frozen 32K cohort 官方分數 0/130 退步、129/130 EOS 前答案 token exact；依使用者接受的 task-level 品質取捨，升為目前首選 approximate path。需要 bit-exact 對照時使用 `triton_prepare`。
 - `twilight_layer_projection=true` 的 full-layer QKV batching：BF16 exact comparison 未通過，因此只保留 `layer_rope=true`，不在 baseline 開 full-layer projection。
 
 ## 6. Evidence boundary
