@@ -1,4 +1,5 @@
 import transformers
+import time
 from transformers.models.llama.modeling_llama import (
     logger,
     apply_rotary_pos_emb,
@@ -99,8 +100,55 @@ def LlamaAttention_fast_forward(
     )
     if use_layer_batched_selection or use_layer_full_attention:
         prepared_group_states = []
+        normal_timeline = bool(
+            getattr(past_key_value, "_normal_overlap_timeline_enabled", False)
+        )
+        normal_host_origin = getattr(
+            past_key_value, "_normal_overlap_host_origin", None
+        )
+        normal_prep_host_start = time.perf_counter() if normal_timeline else None
+        normal_prep_start = (
+            past_key_value._event(timing=True) if normal_timeline else None
+        )
+        if normal_prep_start is not None:
+            normal_prep_start.record(torch.cuda.current_stream())
         layer_projection = bool(getattr(self, '_twilight_layer_projection', False)) and use_layer_batched_selection
         layer_rope = bool(getattr(self, '_twilight_layer_rope', False)) and use_layer_batched_selection
+        projection_graph = bool(getattr(self, '_twilight_projection_graph', False)) and use_layer_batched_selection
+        if projection_graph:
+            if layer_projection or not layer_rope or position_embeddings is None:
+                raise ValueError('grouped projection graph requires layer RoPE and position embeddings')
+            from .twilight_projection_graph import ExactLayerProjectionGraph
+
+            def project_original_groups(graph_hidden, graph_embeddings):
+                states = []
+                for group in range(self.num_key_value_heads):
+                    self.q_proj.weight.data = self.q_proj_list[group].data
+                    self.k_proj.weight.data = self.k_proj_list[group].data
+                    self.v_proj.weight.data = self.v_proj_list[group].data
+                    query = self.q_proj(graph_hidden).view(
+                        bsz, q_len, num_heads, self.head_dim).transpose(1, 2)
+                    key = self.k_proj(graph_hidden).view(
+                        bsz, q_len, 1, self.head_dim).transpose(1, 2)
+                    value = self.v_proj(graph_hidden).view(
+                        bsz, q_len, 1, self.head_dim).transpose(1, 2)
+                    states.append((query, key, value, *graph_embeddings))
+                cos, sin = graph_embeddings
+                all_query = torch.cat([state[0] for state in states], dim=1)
+                all_key = torch.cat([state[1] for state in states], dim=1)
+                all_query, all_key = apply_rotary_pos_emb(all_query, all_key, cos, sin)
+                return [
+                    (all_query[:, group*num_heads:(group+1)*num_heads],
+                     all_key[:, group:group+1], state[2], cos, sin)
+                    for group, state in enumerate(states)
+                ]
+
+            graph = getattr(self, '_twilight_projection_graph_state', None)
+            if graph is None:
+                graph = ExactLayerProjectionGraph(
+                    hidden_states, position_embeddings, project_original_groups)
+                self._twilight_projection_graph_state = graph
+            prepared_group_states = graph(hidden_states, position_embeddings)
         if layer_projection:
             # Full-weight views were retained before head-wise prefill mutates
             # Parameter.data. No per-token weight concatenation or copy.
@@ -123,7 +171,7 @@ def LlamaAttention_fast_forward(
                 prepared_group_states.append((
                     query_states[:, i*num_heads:(i+1)*num_heads],
                     key_states[:, i:i+1], value_states[:, i:i+1], cos, sin))
-        for i in range(0 if layer_projection else self.num_key_value_heads):
+        for i in range(0 if layer_projection or projection_graph else self.num_key_value_heads):
             self.q_proj.weight.data = self.q_proj_list[i].data
             self.k_proj.weight.data = self.k_proj_list[i].data
             self.v_proj.weight.data = self.v_proj_list[i].data
@@ -150,7 +198,7 @@ def LlamaAttention_fast_forward(
             prepared_group_states.append(
                 (query_states, key_states, value_states, cos, sin)
             )
-        if layer_rope and not layer_projection:
+        if layer_rope and not layer_projection and not projection_graph:
             cos, sin = prepared_group_states[0][3:]
             all_query = torch.cat([state[0] for state in prepared_group_states], dim=1)
             all_key = torch.cat([state[1] for state in prepared_group_states], dim=1)
@@ -159,6 +207,29 @@ def LlamaAttention_fast_forward(
                 (all_query[:, i*num_heads:(i+1)*num_heads], all_key[:, i:i+1], state[2], cos, sin)
                 for i, state in enumerate(prepared_group_states)
             ]
+        if normal_timeline:
+            if normal_host_origin is None or normal_prep_host_start is None:
+                raise AssertionError("normal-overlap model-prep origin is missing")
+            normal_prep_end = past_key_value._event(timing=True)
+            normal_prep_end.record(torch.cuda.current_stream())
+            past_key_value._normal_overlap_model_prep_events.append(
+                {
+                    "layer": self.layer_idx // self.num_key_value_heads,
+                    "start_event": normal_prep_start,
+                    "end_event": normal_prep_end,
+                    "host_start_ms": (
+                        normal_prep_host_start - normal_host_origin
+                    )
+                    * 1000.0,
+                    "host_end_ms": (
+                        time.perf_counter() - normal_host_origin
+                    )
+                    * 1000.0,
+                    "q_projection_calls": self.num_key_value_heads,
+                    "k_projection_calls": self.num_key_value_heads,
+                    "v_projection_calls": self.num_key_value_heads,
+                }
+            )
         if use_layer_batched_selection:
             past_key_value.prepare_layer_selection(
                 entries=[self.layer_idx + i for i in range(self.num_key_value_heads)],

@@ -122,8 +122,14 @@ class QuestTopKOffloadedCache(Cache):
             torch.empty(packed_shape, dtype=dtype, device="cpu", pin_memory=True)
             for _ in range(2)
         ]
-        self._gpu_pack_keys = torch.empty(packed_shape, dtype=dtype, device=device)
-        self._gpu_pack_values = torch.empty(packed_shape, dtype=dtype, device=device)
+        self._gpu_pack_keys = (
+            None if getattr(self, "vram_lazy_gpu_pack", False)
+            else torch.empty(packed_shape, dtype=dtype, device=device)
+        )
+        self._gpu_pack_values = (
+            None if getattr(self, "vram_lazy_gpu_pack", False)
+            else torch.empty(packed_shape, dtype=dtype, device=device)
+        )
         self._pack_ready: list[Optional[torch.cuda.Event]] = [None, None]
         self._pack_cursor = 0
         self._layer_flat_group_count: Optional[int] = None
@@ -686,18 +692,33 @@ class QuestTopKOffloadedCache(Cache):
             torch.empty(history_capacity, dtype=torch.long, device="cpu")
             for _ in range(2)
         ]
-        self._gpu_layer_flat_history_keys = torch.empty(
-            host_shape, dtype=self.dtype, device=self.device
-        )
-        self._gpu_layer_flat_history_values = torch.empty(
-            host_shape, dtype=self.dtype, device=self.device
+        if not getattr(self, "vram_alias_history_staging", False):
+            self._gpu_layer_flat_history_keys = torch.empty(
+                host_shape, dtype=self.dtype, device=self.device
+            )
+            self._gpu_layer_flat_history_values = torch.empty(
+                host_shape, dtype=self.dtype, device=self.device
+            )
+        attention_capacity = (
+            max(1, (history_capacity + query_heads) // 2)
+            if getattr(self, "vram_ondemand_attention_capacity", False)
+            else history_capacity + query_heads
         )
         self._gpu_layer_flat_attention_keys = torch.empty(
-            attention_shape, dtype=self.dtype, device=self.device
+            (attention_capacity, 1, self.geometry.head_dim),
+            dtype=self.dtype, device=self.device
         )
         self._gpu_layer_flat_attention_values = torch.empty(
-            attention_shape, dtype=self.dtype, device=self.device
+            (attention_capacity, 1, self.geometry.head_dim),
+            dtype=self.dtype, device=self.device
         )
+        if getattr(self, "vram_alias_history_staging", False):
+            self._gpu_layer_flat_history_keys = (
+                self._gpu_layer_flat_attention_keys[:, 0]
+            )
+            self._gpu_layer_flat_history_values = (
+                self._gpu_layer_flat_attention_values[:, 0]
+            )
         self._layer_flat_group_count = group_count
 
     def update_layer_flat_ragged(
@@ -991,7 +1012,8 @@ class QuestTopKOffloadedCache(Cache):
             if tensor is not None
         )
         execution_tensors = (
-            [self._gpu_pack_keys, self._gpu_pack_values]
+            [tensor for tensor in (self._gpu_pack_keys, self._gpu_pack_values)
+             if tensor is not None]
             + [
                 tensor
                 for tensor in (
@@ -1010,10 +1032,10 @@ class QuestTopKOffloadedCache(Cache):
             "host_slab_bytes": self._host_slab.numel() * self._host_slab.element_size(),
             "host_slab_pinned": self._host_slab.is_pinned(),
             "metadata_gpu_bytes": metadata_bytes,
-            "execution_buffer_gpu_bytes": sum(
-                tensor.numel() * tensor.element_size()
+            "execution_buffer_gpu_bytes": sum({
+                tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
                 for tensor in execution_tensors
-            ),
+            }.values()),
             "block_size": self.block_size,
             "budget_fraction": self.budget_fraction,
             "selection_interval": self.selection_interval,
