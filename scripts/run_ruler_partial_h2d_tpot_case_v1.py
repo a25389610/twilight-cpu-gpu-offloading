@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run one true Partial-H2D TPOT case for the frozen RULER 2K request."""
+"""Run one Partial-H2D TPOT case.
+
+Twilight cache-off uses the current optimized profile automatically; see
+``TWILIGHT_CURRENT_PATHS.md``. Resident-cache ablation switches remain open.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-head-count", type=int, required=True)
     parser.add_argument("--full-layer-flat", action="store_true")
     parser.add_argument("--decode-steps", type=int, default=128)
+    parser.add_argument(
+        "--greedy-probe", action="store_true",
+        help="Diagnostic greedy token trajectory; do not compare its TPOT to fixed-token formal runs.",
+    )
+    parser.add_argument(
+        "--greedy-probe-stop-at-eos", action="store_true",
+        help="Quality-only: stop after the first EOS token (minimum two decode steps).",
+    )
     parser.add_argument("--sink-tokens", type=int, default=64)
     parser.add_argument("--recent-tokens", type=int, default=256)
     parser.add_argument("--quest-budget-fraction", type=float)
@@ -57,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--twilight-cpu-native-gather", action="store_true")
     parser.add_argument("--twilight-direct-attention-layout", action="store_true")
     parser.add_argument("--twilight-layer-projection", action="store_true")
+    parser.add_argument("--twilight-projection-graph", action="store_true")
     parser.add_argument("--twilight-layer-rope", action="store_true")
     parser.add_argument("--twilight-early-gpu-metadata", action="store_true")
     parser.add_argument("--twilight-gather-h2d-chunks", type=int, default=0)
@@ -68,6 +81,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--twilight-previous-token-resident-cache", action="store_true"
     )
+    parser.add_argument("--twilight-resident-zero-copy", action="store_true")
+    parser.add_argument("--twilight-resident-precompute-gpu-mapping", action="store_true")
+    parser.add_argument("--twilight-exact-scan-graph", action="store_true")
+    parser.add_argument("--twilight-exact-top-p-graph", action="store_true")
+    parser.add_argument("--twilight-vram-alias-history-staging", action="store_true")
+    parser.add_argument("--twilight-vram-lazy-gpu-pack", action="store_true")
+    parser.add_argument("--twilight-vram-ondemand-attention-capacity", action="store_true")
+    parser.add_argument("--twilight-vram-tight-resident-capacity", action="store_true")
+    parser.add_argument(
+        "--twilight-resident-mapping-backend", choices=("torch", "native", "native_compact", "gpu_bitmap"),
+        default="torch",
+    )
+    parser.add_argument(
+        "--twilight-resident-hit-copy-backend", choices=("torch", "triton"),
+        default="torch",
+    )
+    parser.add_argument(
+        "--twilight-resident-snapshot-backend", choices=("torch", "triton", "contiguous"),
+        default="torch",
+    )
+    parser.add_argument(
+        "--twilight-resident-position-snapshot-backend",
+        choices=("clone", "reference"), default="clone",
+    )
+    parser.add_argument("--twilight-resident-pack-hit-indices", action="store_true")
     parser.add_argument(
         "--twilight-gpu-compact-gqa-union", action="store_true",
         help="Build the exact GQA union in a GPU bitmap and transfer that compact map.",
@@ -117,6 +155,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host-memory-trace", action="store_true",
                         help="Diagnostic snapshots outside per-token latency timers; perturbs inter-token schedule.")
     parser.add_argument(
+        "--vram-inventory-output", type=Path,
+        help="Diagnostic-only unique-storage inventory after D32; not a formal TPOT run.",
+    )
+    parser.add_argument(
+        "--vram-selection-workspace-probe", action="store_true",
+        help="Diagnostic-only D33 per-layer live Selection workspace and allocator peak.",
+    )
+    parser.add_argument(
         "--twilight-qk-backend", choices=("pytorch", "triton", "triton_prepare"),
         default="pytorch",
         help="triton_prepare fuses K preparation; triton also changes QK reduction (experimental).",
@@ -151,6 +197,20 @@ def parse_args() -> argparse.Namespace:
             "exclusive 100%% work breakdown. This intentionally disables "
             "overlap and never enters formal TPOT."
         ),
+    )
+    parser.add_argument(
+        "--profile-normal-overlap",
+        action="store_true",
+        help=(
+            "Profile post-TPOT diagnostic tokens without phase-boundary "
+            "synchronization. Emits CUDA-Event/CPU-wall intervals and a "
+            "common-origin Chrome trace; never enters formal TPOT."
+        ),
+    )
+    parser.add_argument(
+        "--profile-normal-overlap-trace",
+        type=Path,
+        help="Chrome trace output path for --profile-normal-overlap.",
     )
     return parser.parse_args()
 
@@ -401,16 +461,454 @@ class ExclusiveBreakdownProfiler:
         self._originals = {}
 
 
+class NormalOverlapProfiler:
+    """Diagnostic-only labels and CUDA Events with no boundary syncs."""
+
+    def __init__(self, cache: Any, model: Any, mp_module: Any) -> None:
+        self.cache = cache
+        self.model = model
+        self.mp_module = mp_module
+        self._hook_handles: list[Any] = []
+        self._module_pending: dict[int, tuple[torch.cuda.Event, float]] = {}
+        self._event_intervals: list[
+            tuple[str, torch.cuda.Event, torch.cuda.Event, float, float]
+        ] = []
+        self._originals: dict[tuple[Any, str], Any] = {}
+        self._gpu_origin: torch.cuda.Event | None = None
+        self._host_origin: float | None = None
+
+    @staticmethod
+    def _event() -> torch.cuda.Event:
+        return torch.cuda.Event(enable_timing=True, blocking=False)
+
+    def reset_token(self) -> None:
+        self._module_pending = {}
+        self._event_intervals = []
+        self._gpu_origin = self._event()
+        self._gpu_origin.record(torch.cuda.current_stream())
+        self._host_origin = time.perf_counter()
+        self.cache._normal_overlap_timeline_enabled = True
+        self.cache._normal_overlap_gpu_origin = self._gpu_origin
+        self.cache._normal_overlap_host_origin = self._host_origin
+        self.cache._normal_overlap_selection_events = []
+        self.cache._normal_overlap_cache_events = []
+        self.cache._normal_overlap_model_prep_events = []
+        self.cache._normal_overlap_new_kv_events = []
+
+    def resolve_token(self, wall_seconds: float) -> dict[str, Any]:
+        if self._module_pending:
+            raise AssertionError("normal-overlap module range did not close")
+        if self._gpu_origin is None or self._host_origin is None:
+            raise AssertionError("normal-overlap token was not started")
+        torch.cuda.synchronize()
+        intervals = []
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        host_totals: dict[str, float] = {}
+        for name, start, end, host_start, host_end in self._event_intervals:
+            start_ms = self._gpu_origin.elapsed_time(start)
+            end_ms = self._gpu_origin.elapsed_time(end)
+            elapsed_seconds = max(0.0, end_ms - start_ms) / 1000.0
+            totals[name] = totals.get(name, 0.0) + elapsed_seconds
+            counts[name] = counts.get(name, 0) + 1
+            host_totals[name] = host_totals.get(name, 0.0) + max(
+                0.0, host_end - host_start
+            )
+            intervals.append(
+                {
+                    "name": name,
+                    "gpu_start_ms": start_ms,
+                    "gpu_end_ms": end_ms,
+                    "gpu_duration_ms": max(0.0, end_ms - start_ms),
+                    "host_start_ms": (host_start - self._host_origin) * 1000.0,
+                    "host_end_ms": (host_end - self._host_origin) * 1000.0,
+                }
+            )
+        cache_timeline = {
+            "model_prep": [],
+            "selection": [],
+            "cache_update": [],
+            "new_kv": [],
+        }
+        for item in getattr(self.cache, "_normal_overlap_model_prep_events", []):
+            resolved = {
+                key: value
+                for key, value in item.items()
+                if not key.endswith("_event")
+            }
+            start = item.get("start_event")
+            end = item.get("end_event")
+            if start is not None and end is not None:
+                resolved["gpu_start_ms"] = self._gpu_origin.elapsed_time(start)
+                resolved["gpu_end_ms"] = self._gpu_origin.elapsed_time(end)
+            cache_timeline["model_prep"].append(resolved)
+        for item in getattr(self.cache, "_normal_overlap_selection_events", []):
+            resolved = {
+                key: value
+                for key, value in item.items()
+                if not key.endswith("_event")
+            }
+            for prefix in (
+                "selection_core", "gpu_union", "index_d2h",
+            ):
+                start = item.get(f"{prefix}_start_event")
+                end = item.get(f"{prefix}_end_event")
+                if start is not None and end is not None:
+                    resolved[f"{prefix}_start_ms"] = self._gpu_origin.elapsed_time(
+                        start
+                    )
+                    resolved[f"{prefix}_end_ms"] = self._gpu_origin.elapsed_time(end)
+            for key in ("query_prepare_end", "quest_first_round_end"):
+                event = item.get(f"{key}_event")
+                if event is not None:
+                    resolved[f"{key}_ms"] = self._gpu_origin.elapsed_time(event)
+            cache_timeline["selection"].append(resolved)
+        for item in getattr(self.cache, "_normal_overlap_cache_events", []):
+            resolved = {
+                key: value
+                for key, value in item.items()
+                if key not in {"chunks", "subphases"} and not key.endswith("_event")
+            }
+            subphases = []
+            for phase in item.get("subphases", []):
+                resolved_phase = {
+                    key: value for key, value in phase.items()
+                    if not key.endswith("_event")
+                }
+                resolved_phase["gpu_start_ms"] = self._gpu_origin.elapsed_time(
+                    phase["start_event"]
+                )
+                resolved_phase["gpu_end_ms"] = self._gpu_origin.elapsed_time(
+                    phase["end_event"]
+                )
+                subphases.append(resolved_phase)
+            resolved["subphases"] = subphases
+            chunks = []
+            for chunk in item.get("chunks", []):
+                resolved_chunk = {
+                    key: value
+                    for key, value in chunk.items()
+                    if not key.endswith("_event")
+                }
+                start = chunk.get("selected_kv_h2d_start_event")
+                end = chunk.get("selected_kv_h2d_end_event")
+                if start is not None and end is not None:
+                    resolved_chunk["selected_kv_h2d_start_ms"] = (
+                        self._gpu_origin.elapsed_time(start)
+                    )
+                    resolved_chunk["selected_kv_h2d_end_ms"] = (
+                        self._gpu_origin.elapsed_time(end)
+                    )
+                chunks.append(resolved_chunk)
+            resolved["chunks"] = chunks
+            cache_timeline["cache_update"].append(resolved)
+        for item in getattr(self.cache, "_normal_overlap_new_kv_events", []):
+            resolved = {
+                key: value
+                for key, value in item.items()
+                if not key.endswith("_event")
+            }
+            start = item.get("d2h_start_event")
+            end = item.get("d2h_end_event")
+            if start is not None and end is not None:
+                resolved["d2h_start_ms"] = self._gpu_origin.elapsed_time(start)
+                resolved["d2h_end_ms"] = self._gpu_origin.elapsed_time(end)
+            cache_timeline["new_kv"].append(resolved)
+        return {
+            "diagnostic_token_wall_seconds": wall_seconds,
+            "gpu_active_seconds": totals,
+            "host_submit_seconds": host_totals,
+            "invocation_counts": counts,
+            "module_intervals": intervals,
+            "cache_timeline": cache_timeline,
+        }
+
+    def _register_module(self, module: Any, name: str) -> None:
+        def pre_hook(current: Any, inputs: Any) -> None:
+            del inputs
+            start = self._event()
+            start.record(torch.cuda.current_stream())
+            self._module_pending[id(current)] = (
+                start,
+                time.perf_counter(),
+            )
+
+        def post_hook(current: Any, inputs: Any, output: Any) -> None:
+            del inputs, output
+            pending = self._module_pending.pop(id(current))
+            start, host_start = pending
+            end = self._event()
+            end.record(torch.cuda.current_stream())
+            host_end = time.perf_counter()
+            self._event_intervals.append((name, start, end, host_start, host_end))
+
+        self._hook_handles.append(module.register_forward_pre_hook(pre_hook))
+        self._hook_handles.append(module.register_forward_hook(post_hook))
+
+    def _wrap(self, owner: Any, attribute: str, name: str) -> None:
+        original = getattr(owner, attribute)
+        self._originals[(owner, attribute)] = original
+
+        def wrapper(*args: Any, **kwargs: Any):
+            start = self._event()
+            start.record(torch.cuda.current_stream())
+            host_start = time.perf_counter()
+            result = original(*args, **kwargs)
+            end = self._event()
+            end.record(torch.cuda.current_stream())
+            host_end = time.perf_counter()
+            self._event_intervals.append(
+                (name, start, end, host_start, host_end)
+            )
+            return result
+
+        setattr(owner, attribute, wrapper)
+
+    def install(self) -> None:
+        self._register_module(self.model.model.embed_tokens, "model/embedding")
+        for layer in self.model.model.layers:
+            self._register_module(layer.self_attn.o_proj, "model/o_projection")
+            self._register_module(layer.mlp, "model/mlp")
+            self._register_module(layer.input_layernorm, "model/normalization")
+            self._register_module(
+                layer.post_attention_layernorm, "model/normalization"
+            )
+        self._register_module(self.model.model.norm, "model/normalization")
+        self._register_module(self.model.lm_head, "model/lm_head")
+
+        self._wrap(
+            self.cache,
+            "prepare_layer_selection",
+            "selection/prepare_layer_total",
+        )
+        self._wrap(
+            self.cache,
+            "update_layer_gqa_group_ragged",
+            "post_selection/cache_update_total",
+        )
+        self._wrap(
+            self.cache,
+            "_schedule_batched_new_kv_d2h",
+            "new_kv/stage_and_schedule",
+        )
+        self._wrap(
+            self.cache,
+            "_flush_batched_new_kv",
+            "new_kv/wait_and_host_scatter",
+        )
+        self._wrap(
+            self.mp_module,
+            "apply_rotary_pos_emb",
+            "model/rope",
+        )
+        self._wrap(
+            self.mp_module,
+            "_flash_attention_varlen_forward",
+            "model/attention",
+        )
+
+    def uninstall(self) -> None:
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+        self._module_pending = {}
+        for (owner, attribute), original in self._originals.items():
+            setattr(owner, attribute, original)
+        self._originals = {}
+        self.cache._normal_overlap_timeline_enabled = False
+
+
+def write_normal_overlap_chrome_trace(
+    path: Path, profile: dict[str, Any]
+) -> None:
+    """Write the custom common-origin CPU/GPU timeline as Chrome trace JSON."""
+    events: list[dict[str, Any]] = []
+
+    def add(name: str, category: str, lane: str, start_ms: float, end_ms: float) -> None:
+        if end_ms < start_ms:
+            raise AssertionError(f"negative trace interval: {name}")
+        events.append(
+            {
+                "name": name,
+                "cat": category,
+                "ph": "X",
+                "ts": start_ms * 1000.0,
+                "dur": (end_ms - start_ms) * 1000.0,
+                "pid": "Twilight diagnostic token",
+                "tid": lane,
+            }
+        )
+
+    for item in profile["module_intervals"]:
+        add(
+            item["name"], "GPU/module", "GPU default stream",
+            item["gpu_start_ms"], item["gpu_end_ms"],
+        )
+        add(
+            item["name"], "CPU/submit", "CPU main thread",
+            item["host_start_ms"], item["host_end_ms"],
+        )
+    timeline = profile["cache_timeline"]
+    for item in timeline["model_prep"]:
+        layer = item["layer"]
+        add(
+            f"L{layer} QKV + RoPE + tensor prep", "GPU/model prep",
+            "GPU default stream", item["gpu_start_ms"], item["gpu_end_ms"],
+        )
+        add(
+            f"L{layer} QKV + RoPE host span", "CPU/model prep",
+            "CPU main thread", item["host_start_ms"], item["host_end_ms"],
+        )
+    for item in timeline["selection"]:
+        layer = item["layer"]
+        for prefix, label in (
+            ("selection_core", "Selection core"),
+            ("gpu_union", "GPU GQA union"),
+            ("index_d2h", "index bitmap D2H"),
+        ):
+            start = item.get(f"{prefix}_start_ms")
+            end = item.get(f"{prefix}_end_ms")
+            if start is not None and end is not None:
+                add(f"L{layer} {label}", "GPU/selection", "GPU default stream", start, end)
+        add(
+            f"L{layer} Selection host span", "CPU/selection", "CPU main thread",
+            item["selection_host_start_ms"], item["selection_host_end_ms"],
+        )
+        if item.get("cpu_decode_start_ms") is not None:
+            add(
+                f"L{layer} CPU bitmap decode", "CPU/index", "CPU main thread",
+                item["cpu_decode_start_ms"], item["cpu_decode_end_ms"],
+            )
+    for item in timeline["cache_update"]:
+        layer = item["layer"]
+        add(
+            f"L{layer} cache update host span", "CPU/cache", "CPU main thread",
+            item["cache_host_start_ms"], item["cache_host_end_ms"],
+        )
+        for phase in item.get("subphases", []):
+            add(
+                f"L{layer} {phase['name']}", "GPU/resident cache",
+                "GPU default stream", phase["gpu_start_ms"],
+                phase["gpu_end_ms"],
+            )
+            add(
+                f"L{layer} {phase['name']} host", "CPU/resident cache",
+                "CPU main thread", phase["host_start_ms"],
+                phase["host_end_ms"],
+            )
+        for index, chunk in enumerate(item["chunks"]):
+            add(
+                f"L{layer} gather C{index}", "CPU/gather", "CPU gather",
+                chunk["cpu_gather_start_ms"], chunk["cpu_gather_end_ms"],
+            )
+            add(
+                f"L{layer} H2D enqueue C{index}", "CPU/H2D enqueue", "CPU main thread",
+                chunk["h2d_enqueue_start_ms"], chunk["h2d_enqueue_end_ms"],
+            )
+            add(
+                f"L{layer} selected-KV H2D C{index}", "GPU/H2D", "GPU default stream",
+                chunk["selected_kv_h2d_start_ms"], chunk["selected_kv_h2d_end_ms"],
+            )
+    for item in timeline["new_kv"]:
+        if item.get("d2h_start_ms") is not None:
+            add(
+                "new-KV D2H", "GPU/D2H", "GPU eviction stream",
+                item["d2h_start_ms"], item["d2h_end_ms"],
+            )
+        if item.get("host_wait_start_ms") is not None:
+            add(
+                "new-KV completion wait", "CPU/new-KV", "CPU main thread",
+                item["host_wait_start_ms"], item["host_wait_end_ms"],
+            )
+        if item.get("host_scatter_start_ms") is not None:
+            add(
+                "new-KV host scatter", "CPU/new-KV", "CPU main thread",
+                item["host_scatter_start_ms"], item["host_scatter_end_ms"],
+            )
+    path.write_text(json.dumps({"traceEvents": events}, indent=2) + "\n")
+
+
+def apply_current_nonresident_twilight_profile(
+    args: argparse.Namespace, argv: list[str]
+) -> None:
+    """Keep the active cache-off runner on the measured 121 ms/token path.
+
+    Resident-cache runs retain their existing switches for ablation.  Older
+    cache-off implementations remain in the shared cache class only because
+    some resident-cache experiments still use them.
+    """
+    if args.twilight_top_p is None or args.twilight_previous_token_resident_cache:
+        return
+
+    def supplied(name: str) -> bool:
+        return any(item == name or item.startswith(name + "=") for item in argv)
+
+    if args.short_head_count != 0:
+        raise ValueError("current cache-off Twilight requires --short-head-count 0")
+    required = (
+        "quest_layer_batched_selection",
+        "twilight_gqa_group",
+        "twilight_cpu_flat_gather",
+        "twilight_cpu_bitmap_union",
+        "twilight_direct_attention_layout",
+        "twilight_layer_rope",
+        "twilight_early_gpu_metadata",
+        "twilight_reuse_quant_metadata",
+        "twilight_fused_quest_score",
+        "twilight_skip_unused_host_views",
+        "twilight_gpu_compact_gqa_union",
+        "twilight_batched_new_kv_d2h",
+    )
+    excluded = (
+        "twilight_layer_flat_ragged",
+        "twilight_cpu_native_gather",
+        "twilight_layer_projection",
+        "twilight_fused_final_indices",
+        "twilight_cpu_run_gather",
+        "twilight_post_selection_pipeline",
+        "twilight_per_head_varlen_reference",
+        "sparse_gather_stabilized",
+    )
+    active = [name for name in excluded if getattr(args, name)]
+    if active:
+        raise ValueError(
+            "old cache-off Twilight path is retired: " + ", ".join(active)
+        )
+    fixed = {
+        "twilight_budget_mode": ("dynamic", "--twilight-budget-mode"),
+        "twilight_qk_backend": ("triton_prepare", "--twilight-qk-backend"),
+        "twilight_gather_h2d_chunks": (4, "--twilight-gather-h2d-chunks"),
+        "twilight_new_kv_d2h_granularity": (
+            "token", "--twilight-new-kv-d2h-granularity"
+        ),
+    }
+    for name, (value, option) in fixed.items():
+        if supplied(option) and getattr(args, name) != value:
+            raise ValueError(
+                f"old cache-off Twilight path is retired: {option} must be {value}"
+            )
+        setattr(args, name, value)
+    for name in required:
+        setattr(args, name, True)
+
+
 def main() -> int:
     args = parse_args()
+    apply_current_nonresident_twilight_profile(args, sys.argv[1:])
     if not 0 <= args.short_head_count <= NUM_ENTRIES:
         raise ValueError("short-head-count must be in [0, 224]")
     if args.decode_steps < 2:
         raise ValueError("decode-steps must be at least 2")
+    if args.greedy_probe_stop_at_eos and not args.greedy_probe:
+        raise ValueError("--greedy-probe-stop-at-eos requires --greedy-probe")
     if args.quest_selection_interval <= 0:
         raise ValueError("quest-selection-interval must be positive")
     if args.profile_breakdown_steps < 1:
         raise ValueError("profile-breakdown-steps must be positive")
+    if args.profile_normal_overlap and args.profile_normal_overlap_trace is None:
+        raise ValueError(
+            "--profile-normal-overlap requires --profile-normal-overlap-trace"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
     if args.quest_budget_fraction is not None and args.twilight_top_p is not None:
@@ -584,7 +1082,16 @@ def main() -> int:
     from headinfer.twilight_offload_cache import TwilightMatchedBudgetOffloadedCache
 
     mp_module.mp_headinfer(model)
-    if args.twilight_layer_projection or args.twilight_layer_rope:
+    vram_stages = {}
+    if args.vram_inventory_output is not None:
+        torch.cuda.synchronize()
+        vram_stages["model_only"] = {
+            "allocated_bytes": torch.cuda.memory_allocated(),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "reserved_bytes": torch.cuda.memory_reserved(),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        }
+    if args.twilight_layer_projection or args.twilight_layer_rope or args.twilight_projection_graph:
         if args.twilight_top_p is None or not args.quest_layer_batched_selection:
             raise ValueError('layer projection requires layer-batched Twilight')
         if model.config.model_type != 'llama':
@@ -597,6 +1104,7 @@ def main() -> int:
             attention._twilight_full_projection_weights = tuple(p.weight.detach() for p in projections)
             attention._twilight_layer_projection = args.twilight_layer_projection
             attention._twilight_layer_rope = args.twilight_layer_rope
+            attention._twilight_projection_graph = args.twilight_projection_graph
     capacity = (
         int(prompt_ids_cpu.shape[1])
         + args.decode_steps
@@ -625,6 +1133,8 @@ def main() -> int:
             gqa_groupwise_execution=args.twilight_gqa_group,
             detailed_selection_profile=args.twilight_detailed_selection_profile,
             qk_backend=args.twilight_qk_backend,
+            exact_scan_graph=args.twilight_exact_scan_graph,
+            exact_top_p_graph=args.twilight_exact_top_p_graph,
             cpu_flat_gather=args.twilight_cpu_flat_gather,
             cpu_bitmap_union=args.twilight_cpu_bitmap_union,
             cpu_native_gather=args.twilight_cpu_native_gather,
@@ -639,6 +1149,19 @@ def main() -> int:
             previous_token_resident_cache=(
                 args.twilight_previous_token_resident_cache
             ),
+            resident_zero_copy=args.twilight_resident_zero_copy,
+            resident_precompute_gpu_mapping=args.twilight_resident_precompute_gpu_mapping,
+            vram_alias_history_staging=args.twilight_vram_alias_history_staging,
+            vram_lazy_gpu_pack=args.twilight_vram_lazy_gpu_pack,
+            vram_ondemand_attention_capacity=args.twilight_vram_ondemand_attention_capacity,
+            vram_tight_resident_capacity=args.twilight_vram_tight_resident_capacity,
+            resident_mapping_backend=args.twilight_resident_mapping_backend,
+            resident_hit_copy_backend=args.twilight_resident_hit_copy_backend,
+            resident_snapshot_backend=args.twilight_resident_snapshot_backend,
+            resident_position_snapshot_backend=(
+                args.twilight_resident_position_snapshot_backend
+            ),
+            resident_pack_hit_indices=args.twilight_resident_pack_hit_indices,
             gpu_compact_gqa_union=args.twilight_gpu_compact_gqa_union,
             gpu_union_validate_cpu=args.twilight_gpu_union_validate_cpu,
             batched_new_kv_d2h=args.twilight_batched_new_kv_d2h,
@@ -728,6 +1251,11 @@ def main() -> int:
                                       cache_state=cache.state_snapshot()))
 
     capture_host_memory('cache_allocated')
+    if args.vram_inventory_output is not None:
+        vram_stages["cache_constructed_before_prefill"] = {
+            "allocated_bytes": torch.cuda.memory_allocated(),
+            "reserved_bytes": torch.cuda.memory_reserved(),
+        }
     prompt_ids = prompt_ids_cpu.to("cuda")
     fixed_id = torch.tensor([[FIXED_TOKEN_ID]], dtype=torch.long, device="cuda")
     torch.cuda.empty_cache()
@@ -750,12 +1278,24 @@ def main() -> int:
     prefill_seconds = time.perf_counter() - prefill_started
     logits = {"P4": output.logits[:, -1, :].float().cpu()}
     capture_host_memory('P4')
+    if args.vram_inventory_output is not None:
+        vram_stages["after_prefill"] = {
+            "allocated_bytes": torch.cuda.memory_allocated(),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "reserved_bytes": torch.cuda.memory_reserved(),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        }
     if not torch.isfinite(logits["P4"]).all():
         raise AssertionError("non-finite P4 logits")
     if int(cache.get_seq_length()) != int(prompt_ids_cpu.shape[1]):
         raise AssertionError("prefill cache length mismatch")
 
     latencies: list[float] = []
+    greedy_token_ids: list[int] = []
+    decode_id = (
+        output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        if args.greedy_probe else fixed_id
+    )
     resident_per_token_metrics: list[dict[str, Any]] = []
     total_started: float | None = None
     total_decode_seconds: float | None = None
@@ -767,9 +1307,11 @@ def main() -> int:
             torch.cuda.synchronize()
             if decode_index == 1:
                 total_started = time.perf_counter()
+            if args.greedy_probe:
+                greedy_token_ids.append(int(decode_id.item()))
             started = time.perf_counter()
             output = model(
-                input_ids=fixed_id,
+                input_ids=decode_id,
                 past_key_values=cache,
                 use_cache=True,
                 num_logits_to_keep=1,
@@ -779,6 +1321,16 @@ def main() -> int:
             torch.cuda.synchronize()
             finished = time.perf_counter()
             latencies.append(finished - started)
+            if args.greedy_probe:
+                decode_id = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if decode_index == 1 and args.vram_inventory_output is not None:
+                vram_stages["through_d1"] = {
+                    "allocated_bytes": torch.cuda.memory_allocated(),
+                    "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                    "reserved_bytes": torch.cuda.memory_reserved(),
+                    "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+                }
+                torch.cuda.reset_peak_memory_stats()
             if args.twilight_resident_profile_each_token:
                 resident_per_token_metrics.append(
                     {"decode_step": decode_index, **cache.resolve_metrics()}
@@ -793,8 +1345,47 @@ def main() -> int:
                     raise AssertionError(f"non-finite D{decode_index} logits")
                 logits[f"D{decode_index}"] = checkpoint
                 capture_host_memory(f'D{decode_index}')
+            if (
+                args.greedy_probe_stop_at_eos
+                and decode_index >= 2
+                and tokenizer.eos_token_id in greedy_token_ids
+            ):
+                if total_started is None:
+                    raise AssertionError("decode timer did not start")
+                total_decode_seconds = finished - total_started
+                break
     if total_decode_seconds is None:
         raise AssertionError("decode timing incomplete")
+    actual_decode_steps = len(latencies)
+    final_checkpoint_key = f"D{actual_decode_steps}"
+    if final_checkpoint_key not in logits:
+        final_checkpoint = output.logits[:, -1, :].float().cpu()
+        if not torch.isfinite(final_checkpoint).all():
+            raise AssertionError(f"non-finite {final_checkpoint_key} logits")
+        logits[final_checkpoint_key] = final_checkpoint
+    if args.vram_inventory_output is not None:
+        from twilight_vram_inventory_v1 import inventory
+        payload = inventory(model, cache, vram_stages["model_only"])
+        payload["stages"] = vram_stages
+        if args.vram_selection_workspace_probe:
+            cache._selection_workspace_probe = True
+            cache._selection_workspace_probe_records = []
+            with torch.inference_mode():
+                model(
+                    input_ids=fixed_id,
+                    past_key_values=cache,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            cache.synchronize()
+            torch.cuda.synchronize()
+            cache._selection_workspace_probe = False
+            payload["selection_workspace_probe_D33"] = (
+                cache._selection_workspace_probe_records
+            )
+        args.vram_inventory_output.parent.mkdir(parents=True, exist_ok=True)
+        args.vram_inventory_output.write_text(json.dumps(payload, indent=2))
 
     attention_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     exclusive_attention_wall_seconds = 0.0
@@ -982,6 +1573,51 @@ def main() -> int:
             exclusive_profiler.uninstall()
         mp_module._flash_attention_forward = original_flash_attention
         mp_module._flash_attention_varlen_forward = original_flash_attention_varlen
+
+    normal_overlap_profile_tokens: list[dict[str, Any]] = []
+    normal_overlap_trace_files: list[str] = []
+    if args.profile_normal_overlap:
+        if args.profile_normal_overlap_trace is None:
+            raise AssertionError("normal-overlap trace path is missing")
+        args.profile_normal_overlap_trace.parent.mkdir(parents=True, exist_ok=True)
+        normal_profiler = NormalOverlapProfiler(cache, model, mp_module)
+        normal_profiler.install()
+        try:
+            for profile_index in range(args.profile_breakdown_steps):
+                cache.enable_metrics(False)
+                torch.cuda.synchronize()
+                trace_path = args.profile_normal_overlap_trace
+                if args.profile_breakdown_steps > 1:
+                    trace_path = trace_path.with_name(
+                        f"{trace_path.stem}_token{profile_index + 1}{trace_path.suffix}"
+                    )
+                normal_profiler.reset_token()
+                diagnostic_started = time.perf_counter()
+                with torch.inference_mode():
+                    output = model(
+                        input_ids=fixed_id,
+                        past_key_values=cache,
+                        use_cache=True,
+                        num_logits_to_keep=1,
+                        return_dict=True,
+                    )
+                cache.synchronize()
+                torch.cuda.synchronize()
+                diagnostic_wall_seconds = time.perf_counter() - diagnostic_started
+                profile_summary = normal_profiler.resolve_token(
+                    diagnostic_wall_seconds
+                )
+                diagnostic_logits = (
+                    output.logits[:, -1, :].float().cpu().contiguous()
+                )
+                profile_summary["diagnostic_logits_sha256"] = hashlib.sha256(
+                    diagnostic_logits.numpy().tobytes()
+                ).hexdigest()
+                normal_overlap_profile_tokens.append(profile_summary)
+                write_normal_overlap_chrome_trace(trace_path, profile_summary)
+                normal_overlap_trace_files.append(str(trace_path))
+        finally:
+            normal_profiler.uninstall()
     transfer_metrics = (
         diagnostic_breakdown_tokens[0] if diagnostic_breakdown_tokens else {}
     )
@@ -1080,9 +1716,13 @@ def main() -> int:
         "dtype": "bfloat16",
         "attention": "flash_attention_2",
         "batch_size": 1,
-        "decode_policy": "fixed",
+        "decode_policy": "greedy_probe" if args.greedy_probe else "fixed",
+        "greedy_probe_stop_at_eos": args.greedy_probe_stop_at_eos,
         "fixed_token_id": FIXED_TOKEN_ID,
+        "greedy_token_ids": greedy_token_ids if args.greedy_probe else None,
+        "greedy_text": tokenizer.decode(greedy_token_ids) if args.greedy_probe else None,
         "decode_steps": args.decode_steps,
+        "actual_decode_steps": actual_decode_steps,
         "short_head_count": len(short_heads),
         "full_head_count": NUM_ENTRIES - len(short_heads),
         "short_heads": short_heads,
@@ -1146,6 +1786,26 @@ def main() -> int:
             args.twilight_previous_token_resident_cache
             if args.twilight_top_p is not None
             else None
+        ),
+        "twilight_resident_mapping_backend": (
+            args.twilight_resident_mapping_backend
+            if args.twilight_previous_token_resident_cache else None
+        ),
+        "twilight_resident_hit_copy_backend": (
+            args.twilight_resident_hit_copy_backend
+            if args.twilight_previous_token_resident_cache else None
+        ),
+        "twilight_resident_snapshot_backend": (
+            args.twilight_resident_snapshot_backend
+            if args.twilight_previous_token_resident_cache else None
+        ),
+        "twilight_resident_position_snapshot_backend": (
+            args.twilight_resident_position_snapshot_backend
+            if args.twilight_previous_token_resident_cache else None
+        ),
+        "twilight_resident_pack_hit_indices": (
+            args.twilight_resident_pack_hit_indices
+            if args.twilight_previous_token_resident_cache else None
         ),
         "twilight_gpu_compact_gqa_union": (
             args.twilight_gpu_compact_gqa_union
@@ -1238,18 +1898,20 @@ def main() -> int:
         "D2_D128_tpot": summarize(latencies[1:]),
         "D1_D128_all": summarize(latencies),
         "total_decode_time_s": total_decode_seconds,
-        "overall_decode_latency_ms_per_token": total_decode_seconds * 1000 / args.decode_steps,
-        "overall_decode_throughput_tok_s": args.decode_steps / total_decode_seconds,
+        "overall_decode_latency_ms_per_token": total_decode_seconds * 1000 / actual_decode_steps,
+        "overall_decode_throughput_tok_s": actual_decode_steps / total_decode_seconds,
         "primary_tpot_definition": (
             "mean synchronized wall time per output token over "
-            f"D2-D{args.decode_steps}; D1 excluded as warm-up"
+            f"D2-D{actual_decode_steps}; D1 excluded as warm-up"
         ),
-        "primary_tpot_token_range": f"D2-D{args.decode_steps}",
+        "primary_tpot_token_range": f"D2-D{actual_decode_steps}",
         "prefill_and_model_load_excluded_from_tpot": True,
         "diagnostic_transfer_metrics_one_post_timing_token": transfer_metrics,
         "physical_kv_transfer_metrics": physical_metrics,
         "diagnostic_breakdown_tokens": diagnostic_breakdown_tokens,
         "exclusive_breakdown_tokens": exclusive_breakdown_tokens,
+        "normal_overlap_profile_tokens": normal_overlap_profile_tokens,
+        "normal_overlap_trace_files": normal_overlap_trace_files,
         "cache_state": cache.state_snapshot(),
         "quest_selection_trace": (
             cache.selection_trace()
@@ -1276,7 +1938,7 @@ def main() -> int:
             for name, value in logits.items()
         },
         "final_logits_sha256": hashlib.sha256(
-            logits[f"D{args.decode_steps}"].contiguous().numpy().tobytes()
+            logits[final_checkpoint_key].contiguous().numpy().tobytes()
         ).hexdigest(),
         "per_token_csv": str(per_token_path),
         "logits_file": str(logits_path),
